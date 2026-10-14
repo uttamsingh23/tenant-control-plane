@@ -12,6 +12,9 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/uttamsingh23/tenant-control-plane/internal/adapters/httpapi"
 	"github.com/uttamsingh23/tenant-control-plane/internal/adapters/postgres"
@@ -47,8 +50,8 @@ func run() error {
 	}
 	store := postgres.NewStore(pool)
 
-	tenants := application.NewTenantService(store, store)
-	tasks := application.NewTaskService(store, store)
+	tenants := application.NewTenantService(store, store, uuid.NewString, time.Now)
+	tasks := application.NewTaskService(store, store, time.Now)
 	relay := application.NewOutboxRelay(store, rabbitmq.NewTaskPublisher(cfg.RabbitMQURL), cfg.OutboxPollInterval, logger)
 	consumer := rabbitmq.NewUpdateConsumer(cfg.RabbitMQURL, tasks, logger)
 

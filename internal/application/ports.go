@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"time"
 
 	"github.com/uttamsingh23/tenant-control-plane/internal/domain"
 )
@@ -9,6 +10,14 @@ import (
 // The interfaces below are what the application layer needs from the
 // outside world. They are defined here, by their consumer, and implemented
 // by the adapters (postgres, rabbitmq).
+
+// IDGenerator returns a new unique identifier for a tenant or task. The
+// PostgreSQL adapter stores IDs as UUIDs; production wiring uses
+// uuid.NewString.
+type IDGenerator func() string
+
+// Clock returns the current time; production wiring uses time.Now.
+type Clock func() time.Time
 
 // TenantRepository persists tenants.
 type TenantRepository interface {

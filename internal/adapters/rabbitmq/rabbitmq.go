@@ -27,7 +27,7 @@ func notImplemented(op string) error {
 // UpdateApplier applies a worker progress update; *application.TaskService
 // satisfies it.
 type UpdateApplier interface {
-	ApplyUpdate(ctx context.Context, update domain.TaskUpdate) error
+	ApplyUpdate(ctx context.Context, update domain.TaskUpdate) (application.UpdateOutcome, error)
 }
 
 // TaskHandler processes one task event; *worker.Simulator satisfies it.
