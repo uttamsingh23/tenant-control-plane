@@ -1,10 +1,20 @@
-# Local dependencies for the control plane. Credentials come from .env
-# (copy .env.example); nothing secret is committed.
+# The whole system: PostgreSQL, RabbitMQ, the control plane (api) and the
+# worker simulator. Credentials come from .env (copy .env.example); nothing
+# secret is committed. `make up` boots everything and waits until healthy.
 name: tenant-control-plane
+
+x-app: &app
+  build: .
+  image: tenant-control-plane:local
+  restart: unless-stopped
+  environment: &app-env
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
 
 services:
   postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -21,17 +31,62 @@ services:
 
   rabbitmq:
     image: rabbitmq:4.1-management-alpine
+    restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
     ports:
       - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
       - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
       interval: 5s
-      timeout: 5s
+      timeout: 10s
       retries: 30
+
+  # Applies migrations on startup (advisory-locked), then serves HTTP and
+  # runs the outbox relay and the update consumer.
+  api:
+    <<: *app
+    command: ["api"]
+    environment:
+      <<: *app-env
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    ports:
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # Flags come from WORKER_ARGS (e.g. --fail-rate=1); WORKER_* variables
+  # set the defaults. Restart it with `make worker WORKER_ARGS=...`.
+  worker:
+    <<: *app
+    entrypoint: ["worker"]
+    command: ${WORKER_ARGS:-}
+    environment:
+      <<: *app-env
+      WORKER_FAIL_RATE: ${WORKER_FAIL_RATE:-0}
+      WORKER_MIN_DELAY_MS: ${WORKER_MIN_DELAY_MS:-500}
+      WORKER_MAX_DELAY_MS: ${WORKER_MAX_DELAY_MS:-2000}
+      WORKER_SEED: ${WORKER_SEED:-0}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_healthy
 
 volumes:
   postgres-data:
+  rabbitmq-data:

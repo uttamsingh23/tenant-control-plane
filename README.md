@@ -1,899 +1,1167 @@
 # Tenant Provisioning Control Plane
 
-A control-plane service that records tenants, emits provisioning tasks over
-RabbitMQ and applies progress reported back by a worker simulator.
+A control-plane service for a multi-tenant SaaS. It records tenants in
+PostgreSQL and turns every tenant mutation into a task. Each task is
+published to RabbitMQ through a transactional outbox. A separate worker
+simulator processes the task, and the progress it reports back is applied
+idempotently and order-tolerantly.
 
-> **Status:** the domain, PostgreSQL persistence, application use cases,
-> the HTTP API, outbound messaging (transactional outbox -> RabbitMQ), the
-> worker simulator and the inbound update consumer are implemented and
-> tested. Creating a tenant walks the full lifecycle with no manual steps.
-
-## Quick start
-
-Requirements: Go 1.25+, Docker with Compose v2, `make`.
+Written in Go 1.26. Everything runs locally in Docker.
 
 ```bash
-make .env        # create local config from .env.example (git-ignored)
-make up          # start PostgreSQL and RabbitMQ, wait until healthy
-make run-api     # control plane on :8080
-make run-worker  # worker simulator, e.g. make run-worker WORKER_ARGS="--fail-rate=1"
-make check       # fmt-check + vet + golangci-lint (incl. gosec) + tests
-make stress      # every concurrency test 20 times under -race (STRESS_COUNT=n)
-make race-check  # concurrent requests against the running api + worker, see below
+git clone https://github.com/uttamsingh23/tenant-control-plane.git && cd tenant-control-plane
+make up      # builds and boots postgres, rabbitmq, api and worker; waits until healthy
+make check   # gofmt, go vet, golangci-lint (+gosec), govulncheck, go test -race ./...
 ```
 
-`make help` lists all targets.
+---
+
+## Contents
+
+1. [Quick start](#1-quick-start)
+2. [Architecture](#2-architecture)
+3. [Technology choices and trade-offs](#3-technology-choices-and-trade-offs)
+4. [Package responsibilities](#4-package-responsibilities)
+5. [State machines](#5-state-machines)
+6. [Database schema and migrations](#6-database-schema-and-migrations)
+7. [HTTP API](#7-http-api)
+8. [Errors and HTTP status mapping](#8-errors-and-http-status-mapping)
+9. [Optimistic locking](#9-optimistic-locking)
+10. [Messaging: outbox, topology and message formats](#10-messaging-outbox-topology-and-message-formats)
+11. [Inbound updates: idempotency and ordering](#11-inbound-updates-idempotency-and-ordering)
+12. [Worker simulator](#12-worker-simulator)
+13. [Walkthroughs](#13-walkthroughs)
+14. [Tests and quality gates](#14-tests-and-quality-gates)
+15. [Configuration reference](#15-configuration-reference)
+16. [Troubleshooting](#16-troubleshooting)
+17. [Known limitations](#17-known-limitations)
+
+---
+
+## 1. Quick start
+
+### Prerequisites
+
+| Tool | Version | Needed for |
+| --- | --- | --- |
+| Docker with Compose v2 | `docker compose` (v2, supports `--wait`) | `make up`, and the integration tests (testcontainers) |
+| GNU or BSD `make` | any | every command below |
+| Go | 1.21 or newer | `make check` / `make test`. `go.mod` pins `toolchain go1.26.9`, which the `go` command downloads automatically. |
+| `curl`, `jq` | any | the walkthrough scripts |
+
+`make up` does not need Go: the binaries are built inside Docker.
+
+### Boot
 
 ```bash
-curl -s localhost:8080/healthz
-# {"status":"ok"}
+make up
 ```
 
-## Project layout
+This command:
+
+1. creates `.env` from `.env.example` if it is missing (local-only throwaway credentials, git-ignored)
+2. builds one image holding both binaries (`Dockerfile`)
+3. starts `postgres` and `rabbitmq` and waits for their health checks
+4. starts `api`, which applies migrations and then serves on <http://localhost:8080>, and waits until `GET /healthz` answers
+5. starts `worker`, once the api is healthy
+
+`docker compose up --wait` returns only when every service is running and
+healthy, and exits non-zero otherwise. Every service has
+`restart: unless-stopped`, so a crashed api or worker comes back. Postgres
+and RabbitMQ data live in named volumes, so tenants survive `make down` /
+`make up`.
+
+```bash
+make ps                  # container status and health
+make logs                # follow api + worker logs (JSON, one line per event)
+curl -s localhost:8080/healthz   # {"status":"ok"}
+```
+
+RabbitMQ management UI: <http://localhost:15672>. The user and password are
+`RABBITMQ_USER` / `RABBITMQ_PASSWORD` from your `.env`.
+
+### Test
+
+```bash
+make check   # every quality gate; exits non-zero on the first failure
+make test    # just the suite: go test -race -count=1 ./...
+```
+
+The integration tests start their own throwaway PostgreSQL and RabbitMQ
+containers with testcontainers, so they do not touch the stack from
+`make up` and do not need it running. See [Tests and quality gates](#14-tests-and-quality-gates).
+
+### See it work
+
+```bash
+make smoke   # one tenant: create -> active -> PATCH -> active -> DELETE -> destroyed
+make replay  # duplicate / out-of-order / poison updates published straight to RabbitMQ
+make race-check RACECHECK_ARGS="-n 64 -rounds 3"   # concurrent creates/PATCHes/DELETEs against the stack
+```
+
+### Stop
+
+```bash
+make down    # stop everything, keep data
+make clean   # stop everything and delete the data volumes
+```
+
+`make help` lists every target.
+
+---
+
+## 2. Architecture
+
+```mermaid
+flowchart LR
+    client([HTTP client])
+
+    subgraph api["api container (cmd/api)"]
+        http["HTTP API<br/>httpapi"]
+        svc["TenantService / TaskService<br/>application"]
+        relay["Outbox relay<br/>(background)"]
+        consumer["Update consumer<br/>(background, N handlers)"]
+    end
+
+    subgraph pg["postgres"]
+        tenants[(tenants)]
+        tasks[(tasks)]
+        outbox[(outbox_events)]
+        processed[(processed_updates)]
+    end
+
+    subgraph mq["rabbitmq"]
+        tx{{"tenant.tasks<br/>(topic)"}}
+        qw[["tenant.tasks.worker<br/>(quorum)"]]
+        ux{{"tenant.task-updates<br/>(topic)"}}
+        qc[["tenant.task-updates.control-plane<br/>(quorum)"]]
+        dlq[["tenant.dead-letter"]]
+    end
+
+    worker["worker container<br/>(cmd/worker)"]
+
+    client -->|REST| http --> svc
+    svc -->|"one transaction:<br/>tenant + task + outbox row"| tenants & tasks & outbox
+    relay -->|"claim (lease)"| outbox
+    relay -->|"publish, wait for confirm,<br/>then mark published"| tx --> qw --> worker
+    worker -->|"in_progress, then done | failed"| ux --> qc --> consumer
+    consumer -->|"one transaction:<br/>key + task + tenant"| processed & tasks & tenants
+    qw -. malformed .-> dlq
+    qc -. "malformed / unknown task /<br/>delivery limit" .-> dlq
+```
+
+The happy path of a create:
+
+1. `POST /v1/tenants` runs one PostgreSQL transaction. It inserts the
+   tenant (`provisioning`, v1), its `deploy` task (`accepted`) and an
+   `outbox_events` row, then commits. The client gets `201` immediately.
+2. The **outbox relay** in the api process claims the committed row and
+   publishes the task to `tenant.tasks`. It waits for the broker's
+   publisher confirm and only then marks the row published.
+3. The **worker** consumes the task, sleeps, publishes `in_progress`,
+   sleeps again, and publishes `done` (or `failed`, with probability
+   `--fail-rate`). It acks the task only after both updates are confirmed.
+4. The **update consumer** in the api process applies each update in one
+   transaction. That transaction records the update's idempotency key,
+   advances the task, and on a terminal outcome moves the tenant
+   (`active`, v2). The delivery is acked after the commit.
+
+There is one deployable image with two commands. The control plane is a
+single process: HTTP server, outbox relay and update consumer share one
+connection pool. It can be scaled horizontally, because relays coordinate
+through leases and consumers compete on one queue.
+
+---
+
+## 3. Technology choices and trade-offs
+
+| Choice | Why | Trade-off accepted |
+| --- | --- | --- |
+| **Go 1.26, `net/http` `ServeMux`** (method + path patterns) | Routing with path params is in the standard library now. No framework to learn or justify. | Middleware (request IDs, panics, timeouts, logging) is hand-written, about 150 lines. |
+| **PostgreSQL 17 + pgx v5** | Transactions, row locks, `FOR UPDATE SKIP LOCKED`, partial unique indexes and triggers give the invariants a second line of defence below the code. | Hand-written SQL rather than an ORM. More code, but every query is visible and reviewable. |
+| **goose migrations, embedded** (`migrations/*.sql` via `embed.FS`) | The binary carries its schema. The api migrates on startup under an advisory lock, so replicas starting together are safe. | No separate migration job. A bad migration blocks api startup, which is visible immediately rather than silent. |
+| **RabbitMQ 4.1, quorum queues, publisher confirms** | Durable, replicated queues. Per-message ack/nack/reject. A built-in dead-letter exchange and a delivery limit that bounds poison messages. A management HTTP API good enough to replay messages by hand. | No log or replay like Kafka. Ordering is per queue, not per tenant, so ordering is handled in the consumer (see [§11](#11-inbound-updates-idempotency-and-ordering)). |
+| **Transactional outbox + polling relay** | The only way to get "published if and only if committed" without distributed transactions. Polling is simple and needs no CDC infrastructure. | Up to `OUTBOX_POLL_INTERVAL` (500ms) of extra latency, and at-least-once publication (duplicates are possible and handled). |
+| **Idempotency table + state-machine guards** on the consumer | Dedup by key handles redelivery. The state machine handles different keys describing stale or contradicting progress. | `processed_updates` grows forever (see [limitations](#17-known-limitations)). |
+| **Optimistic locking** with `version` in the PATCH body | No locks held across requests, and a stale write fails loudly. The version is checked in the `WHERE` clause, so it is atomic. | The client has to re-read and retry on `409`. `If-Match`/ETag would be the more HTTP-native carrier, but the body keeps the precondition next to the change. |
+| **Soft delete** (`destroyed` is a status) | Slugs must stay unique "including against destroyed tenants". Keeping the row makes that a plain `UNIQUE` constraint and keeps task history traceable. | The table never shrinks. |
+| **testcontainers** for integration tests | `make test` needs nothing running and cannot collide with the dev stack. Every test gets its own database and vhost. | Tests need Docker, and the first run pulls images. |
+| **Docker Compose + Makefile** | Everything a reviewer needs in two commands with tools they already have. | Make is not ideal on Windows (WSL works). |
+| **Alpine runtime image** | Small, and has busybox `wget` for the compose health check. | Larger attack surface than distroless. The binaries are static and run as a non-root user. |
+
+---
+
+## 4. Package responsibilities
 
 ```
 cmd/
-  api/              composition root of the control plane
+  api/              composition root of the control plane: config, pool, migrations, relay, consumer, HTTP server
   worker/           composition root of the worker simulator
+  racecheck/        black-box concurrency checker run against a live stack (make race-check)
 internal/
-  domain/           entities, states and error sentinels; no I/O dependencies
-  application/      use cases and the interfaces (ports) they need
-  config/           env/flag configuration loading
+  domain/           Tenant and Task entities, their state machines, validation and error sentinels; no I/O
+  application/      use cases (TenantService, TaskService, OutboxRelay) and the ports (interfaces) they need
+  config/           environment / CLI flag loading and validation, no I/O
   adapters/
-    httpapi/        REST API: routing, JSON encoding, error mapping, server lifecycle
-    postgres/       repository + transaction implementation (pgx)
-    rabbitmq/       task/update publishers and consumers
+    httpapi/        REST routing, JSON encoding, error -> status mapping, middleware, server lifecycle
+    postgres/       repositories, transactions, outbox store, keyset pagination, migration runner (pgx)
+    rabbitmq/       topology, task publisher/consumer, update publisher/consumer, message codecs
+  worker/           provisioning simulator: delays, outcomes, stable update IDs
   testsupport/
-    pgtest/         per-test PostgreSQL databases for integration tests
-    amqptest/       RabbitMQ broker and per-test topologies for integration tests
-    tcpproxy/       TCP proxy that refuses, cuts or blackholes connections on demand
-  worker/           provisioning simulator logic
-migrations/         SQL schema migrations
-docs/schemas/       JSON Schemas of the task event and the progress update
-tests/              end-to-end tests: HTTP API (real router, services, PostgreSQL),
-                    outbound messaging (API -> outbox -> relay -> RabbitMQ) and
-                    inbound messaging (worker update -> RabbitMQ -> consumer -> PostgreSQL)
+    pgtest/         per-test PostgreSQL databases (testcontainers or TEST_DATABASE_URL)
+    amqptest/       per-test RabbitMQ vhosts and topologies (testcontainers or TEST_RABBITMQ_URL)
+    tcpproxy/       TCP proxy that refuses, cuts or blackholes connections to inject broker failures
+migrations/         goose SQL migrations, embedded into the api binary
+docs/schemas/       JSON Schemas of the task event and the progress update (tests validate against them)
+scripts/            lifecycle.sh (make smoke) and replay.sh (make replay)
+tests/              end-to-end tests: real router, services, PostgreSQL and RabbitMQ
 ```
 
 Dependencies point inwards: `adapters → application → domain`. Interfaces
-are declared by the package that consumes them (Go idiom) rather than in a
-shared `ports` package:
+are declared by the package that consumes them (Go idiom):
 
-| Interface                                              | Declared in   | Implemented by                |
-| ------------------------------------------------------ | ------------- | ----------------------------- |
-| `TenantRepository`, `TaskRepository`, `OutboxRepository`, `ProcessedUpdateRepository`, `Transactor` | `application` | `postgres.Store`              |
-| `TaskPublisher`                                        | `application` | `rabbitmq.TaskPublisher`      |
-| `TenantService`, `TaskService`                         | `httpapi`     | `application.*Service`        |
-| `UpdateApplier`, `TaskHandler`                         | `rabbitmq`    | `application.TaskService`, `worker.Simulator` |
-| `UpdatePublisher`                                      | `worker`      | `rabbitmq.UpdatePublisher`    |
-
-## Design
-
-- **Transactional outbox.** See [Outbound messaging](#outbound-messaging).
-- **Idempotent consumer.** Every worker update carries a stable ID. It is
-  recorded in the same transaction that applies the update, so
-  redeliveries are no-ops. Updates for terminal tasks, or that would move
-  a task backwards, are ignored. See [Inbound messaging](#inbound-messaging).
-- **Optimistic locking.** `UPDATE ... WHERE id = $1 AND version = $2`. Zero
-  affected rows means `tenant_version_conflict`.
-
-## Outbound messaging
-
-Every state-changing API call (create, PATCH, DELETE) publishes exactly one
-task event, and only after the change is durably committed.
-
-```
- HTTP request
-     |
-     v
- TenantService ── one transaction ──────────────────────────────┐
-     |   INSERT/UPDATE tenants                                  │
-     |   INSERT tasks                                           │
-     |   INSERT outbox_events (task_id, status snapshot)        │
-     └─ COMMIT ─────────────────────────────────────────────────┘
-                     (201/202 returned to the client)
-
- OutboxRelay (background, one per replica)
-     1. claim   UPDATE outbox_events SET available_at = now()+lease ...  (own short statement, committed)
-     2. publish PublishTask -> RabbitMQ, wait for publisher confirm      (no transaction open)
-     3. mark    UPDATE outbox_events SET published_at = now()            (only after the confirm)
-        or on failure: attempts+1, last_error, available_at = now()+backoff
-
- RabbitMQ
-     exchange tenant.tasks (topic, durable) --task.#--> queue tenant.tasks.worker (quorum, durable)
-     (the worker's side is described under Worker simulator)
-```
-
-### Why an outbox
-
-The database and the broker are two systems with no shared transaction.
-Whichever order you write them in, a crash in between leaves them
-disagreeing:
-
-| Approach | Failure | Result |
+| Interface | Declared in | Implemented by |
 | --- | --- | --- |
-| publish, then commit | commit fails or the process dies | the worker provisions a tenant that does not exist (the brief's "classic bug") |
-| commit, then publish in the request | broker down, or the process dies after commit | the tenant is stuck in `provisioning` forever; the event is lost |
-| **outbox**: commit the event *with* the change, publish afterwards | anything | the event exists if and only if the change committed, and is retried until it reaches the broker |
+| `TenantRepository`, `TaskRepository`, `OutboxRepository`, `ProcessedUpdateRepository`, `Transactor` | `application` | `postgres.Store` |
+| `TaskPublisher` | `application` | `rabbitmq.TaskPublisher` |
+| `TenantService`, `TaskService` | `httpapi` | `application.*Service` |
+| `UpdateApplier`, `TaskHandler` | `rabbitmq` | `application.TaskService`, `worker.Simulator` |
+| `UpdatePublisher` | `worker` | `rabbitmq.UpdatePublisher` |
 
-The outbox row is written by the same transaction as the tenant and task
-(`recordTask` in `application/tenant_service.go`), so a rollback removes
-it too. The relay only ever sees committed rows: its claim is a separate
-statement under READ COMMITTED, so rows of in-flight transactions are
-invisible. It selects by `published_at IS NULL`, never "id above the last
-one seen", so an event whose transaction commits after a later-numbered
-one is not skipped.
+---
 
-### Why it is still not exactly-once
+## 5. State machines
 
-The outbox makes publication *reliable*, not *unique*. Marking the row
-published is a second write to the database after the broker has
-accepted the message, and nothing can make the two atomic:
+### Task
 
-- **Crash between confirm and mark.** The broker has the message, the row
-  still says unpublished. When the lease expires the event is published
-  again.
-- **Lost confirmation.** The connection drops after the broker stored the
-  message but before the confirm arrives. The outcome is unknown, so the
-  relay must retry; if the first attempt landed, that is a duplicate. (The
-  transient-failure test regularly logs a few of these.)
-- **Expired lease.** A relay stalled past its lease (GC pause, network
-  partition) while another relay re-claims and publishes the same event.
+```mermaid
+stateDiagram-v2
+    [*] --> accepted : tenant API call
+    accepted --> in_progress : worker update
+    in_progress --> done : worker update
+    in_progress --> failed : worker update
+    done --> [*]
+    failed --> [*]
+```
 
-The only alternative to "maybe twice" is "maybe never", which the brief
-rules out. So delivery is **at-least-once**, and duplicates are made
-harmless instead:
+`done` and `failed` are terminal. A database trigger refuses any update
+to a terminal task, so not even a buggy code path can regress one.
 
-- The task ID is the event ID and the AMQP `message-id`. Every copy of
-  an event is byte-identical (it is a snapshot taken at commit time).
-- Consumers must be idempotent on that ID. The worker can skip task IDs it
-  has already handled, and the control plane's inbound side deduplicates
-  worker updates by their own IDs (`processed_updates`) and ignores stale
-  transitions.
+### Tenant
 
-### Relay behaviour
+```mermaid
+stateDiagram-v2
+    [*] --> provisioning : POST (deploy task)
+    provisioning --> active : deploy done
+    provisioning --> failed : deploy failed
+    active --> updating : PATCH (update task)
+    updating --> active : update done
+    updating --> failed : update failed
+    active --> destroying : DELETE (destroy task)
+    failed --> destroying : DELETE (destroy task)
+    destroying --> destroyed : destroy done
+    destroying --> failed : destroy failed
+    destroyed --> [*]
+```
 
-- **Claiming without holding a transaction.** A claim is one committed
-  `UPDATE ... RETURNING` that moves `available_at` to now + lease (30s) and
-  sets a fresh `claim_token`. `FOR UPDATE SKIP LOCKED` makes concurrent
-  claims pick disjoint rows; after the commit, the lease keeps other
-  relays off the row. No row lock or transaction is held while waiting for
-  the broker. Lease and retry times use the database clock, so relays on
-  different hosts agree.
-- **Several relays.** Every control-plane replica runs a relay; they share
-  the outbox safely through leases (`TestOutboxConcurrentRelays`).
-- **Confirm before mark.** `PublishTask` returns only after the broker's
-  publisher confirm. A nack, a closed channel, a timeout or a returned
-  message all count as failures. The mark runs on a context that survives
-  shutdown, so a confirm received during shutdown is still recorded.
-- **Retries.** A failed publish increments `attempts`, stores
-  `last_error` and makes the event due again after an exponential backoff
-  from `OUTBOX_RETRY_MIN` to `OUTBOX_RETRY_MAX` with jitter. The rest of
-  the batch is handed back untried (no attempt charged). Database
-  failures back the whole loop off the same way. Failures are logged as
-  warnings, and as errors from the 5th attempt on.
-- **Never discarded.** There is no attempt limit and no dead-letter
-  table: an event stays in the outbox until the broker confirms it.
-  Stuck events are visible with
-  `SELECT task_id, attempts, last_error FROM outbox_events WHERE published_at IS NULL`.
-- **Crash recovery.** If a relay dies with a claimed batch, the events
-  become claimable again when the lease expires (`TestOutboxAbandonedClaimIsRedelivered`).
-  A relay also stops starting new publishes when less than two publish
-  timeouts of its lease remain, and hands the rest of the batch back, so
-  a slow broker cannot make a lease expire mid-publish.
-- **Startup and shutdown.** The broker being down at startup is not fatal:
-  the API serves requests, events accumulate, and the publisher connects
-  when the broker appears. On SIGINT/SIGTERM the relay stops claiming,
-  hands back untried events for immediate pickup, and the publisher's
-  connection is closed after the relay has stopped.
-
-### Broker topology and message format
-
-| Object | Name | Properties |
+| From | API call allowed | Resulting task |
 | --- | --- | --- |
-| Exchange | `tenant.tasks` | topic, durable |
-| Queue | `tenant.tasks.worker` | quorum (replicated, always durable), bound with `task.#`, dead-letters to `tenant.dead-letter` |
-| Routing key | `task.<type>` | `task.deploy`, `task.update`, `task.destroy` |
-| Exchange | `tenant.task-updates` | topic, durable; the worker publishes progress here |
-| Queue | `tenant.task-updates.control-plane` | quorum, bound with `task_update.#`, dead-letters to `tenant.dead-letter` |
-| Routing key | `task_update.<status>` | `task_update.in_progress`, `task_update.done`, `task_update.failed` |
-| Exchange + queue | `tenant.dead-letter` | fanout exchange and quorum queue; rejected messages and messages over the delivery limit |
+| `provisioning`, `updating`, `destroying` | none (task in flight) → `409 tenant_update_not_allowed` | — |
+| `active` | PATCH → `updating`; DELETE → `destroying` | `update` / `destroy` |
+| `failed` | DELETE → `destroying` (PATCH → 409) | `destroy` |
+| `destroyed` | none → 409; GET still returns it | — |
 
-Both processes declare the whole topology on every connect, so neither
-depends on the other having started first.
+Only **terminal** task outcomes move a tenant: deploy `done` → `active`,
+update `done` → `active`, destroy `done` → `destroyed`, any `failed` →
+`failed`. `in_progress` changes the task only.
 
-> **Upgrading a local broker from an earlier version of this repo:** the
-> work queues gained the `x-dead-letter-exchange` argument, and RabbitMQ
-> refuses to redeclare a queue with different arguments
-> (`PRECONDITION_FAILED`). Recreate the queue: `make clean && make up`, or
-> `docker compose exec rabbitmq rabbitmqctl delete_queue tenant.tasks.worker`
-> (this drops the messages in it).
+**At most one open task per tenant** falls out of the guards: every state
+that has an open task refuses new mutations. A partial unique index
+(`tasks_one_open_per_tenant_idx`) backs this up in the database.
 
-The publisher declares the exchange, queue and binding on every connect
-(idempotently), so events published before any worker starts are kept, not
-dropped as unroutable. Messages are published with `mandatory`: if no queue
-is bound, the broker returns the message, the publish fails and is retried,
-and the next connection re-declares the topology.
+The rules live in `internal/domain/tenant.go` and `task.go`, as pure
+functions with table-driven tests.
 
-AMQP properties: `message_id` = task ID, `delivery_mode` = 2 (persistent),
-`content_type` = `application/json`, `type` = `task`, `app_id` =
-`tenant-control-plane`. Body (the task as committed; JSON Schema:
-[`docs/schemas/task-event.v1.json`](docs/schemas/task-event.v1.json)):
+---
 
-```json
-{
-  "id": "6f1c...",
-  "type": "deploy",
-  "tenant_id": "0b7e...",
-  "status": "accepted",
-  "created_at": "2026-01-02T03:04:05.006Z",
-  "updated_at": "2026-01-02T03:04:05.006Z"
-}
+## 6. Database schema and migrations
+
+```mermaid
+erDiagram
+    tenants ||--o{ tasks : "has"
+    tasks ||--|| outbox_events : "announced by"
+    tenants {
+        uuid id PK
+        text slug UK "k8s-namespace regex CHECK; never reused"
+        text name "CHECK not blank"
+        text status "CHECK in 6 states"
+        bigint version "trigger: +1 on every UPDATE"
+        timestamptz created_at "CHECK millisecond precision"
+        timestamptz updated_at
+    }
+    tasks {
+        uuid id PK "= event id"
+        text type "deploy | update | destroy"
+        uuid tenant_id FK
+        text status "accepted | in_progress | done | failed"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    outbox_events {
+        bigint id PK
+        uuid task_id UK,FK "one event per task"
+        text task_status "snapshot at commit"
+        timestamptz occurred_at
+        timestamptz published_at "NULL = pending"
+        timestamptz available_at "lease / retry time"
+        int attempts
+        uuid claim_token
+        text last_error
+    }
+    processed_updates {
+        text update_id PK "idempotency key"
+        timestamptz processed_at
+    }
 ```
 
-Inspecting it locally (management UI at <http://localhost:15672>,
-credentials from `.env`):
+Database-level guarantees (they hold even if the Go code were wrong):
 
-```bash
-docker compose exec rabbitmq rabbitmqctl list_queues name type durable messages
-docker compose exec postgres psql -U control_plane -d control_plane \
-  -c "SELECT task_id, published_at, attempts, last_error FROM outbox_events ORDER BY id DESC LIMIT 10"
-# Simulate a broker outage: the API keeps accepting work, events pile up
-# with growing attempts, and are delivered once the broker is back.
-docker compose stop rabbitmq; sleep 10; docker compose start rabbitmq
-```
-
-### Tests
-
-| Behaviour | Test |
+| Object | Enforces |
 | --- | --- |
-| tenant, task and event commit or roll back together | `postgres/tx_test.go`, `postgres/application_test.go` |
-| only committed events are claimable | `TestOutboxClaimSeesOnlyCommittedEvents` |
-| concurrent claims are disjoint | `TestOutboxConcurrentClaimsAreDisjoint`, `TestOutboxConcurrentRelays` |
-| every mutation publishes its task; rejected calls publish nothing | `TestOutboxPublishesEveryMutation` |
-| broker unavailable at startup | `TestOutboxBrokerUnavailableAtStartup`, `TestPublishTaskBrokerUnavailableAtStartup` |
-| transient failures (connections cut repeatedly) | `TestOutboxTransientBrokerFailures`, `TestPublishTaskReconnects` |
-| crash between confirm and mark: same event redelivered | `TestOutboxCrashWindowRedelivers`, `TestRelayCrashWindowRepublishes` |
-| abandoned claim redelivered after the lease | `TestOutboxAbandonedClaimIsRedelivered` |
-| broker nack, unroutable message, unresponsive broker | `TestPublishTaskNacked`, `TestPublishTaskUnroutable`, `TestPublishTaskUnresponsiveBroker` |
-| durable exchange, quorum queue, persistent messages | `TestTopologyIsDurable`, `TestPublishTaskMessage` |
-| backoff, retry-until-published, shutdown mid-publish | `outbox_relay_test.go` |
+| `tenants_slug_key` (UNIQUE over all rows) | one winner for concurrent same-slug creates; destroyed slugs stay taken |
+| `tenants_guard_update` trigger | `version` increases by exactly 1 on every update; `id`, `slug`, `created_at` immutable |
+| `tasks_guard_update` trigger | terminal tasks are frozen; `id`, `type`, `tenant_id`, `created_at` immutable |
+| `tasks_one_open_per_tenant_idx` (partial UNIQUE) | at most one `accepted`/`in_progress` task per tenant |
+| `outbox_events_task_id_key` | exactly one event per task |
+| `processed_updates` PK | an update key is applied at most once, even by concurrent consumers |
+| CHECK constraints | slug format, non-blank name, valid enums, millisecond timestamps |
 
-Integration tests start PostgreSQL and RabbitMQ containers with
-testcontainers (or use `TEST_DATABASE_URL` / `TEST_RABBITMQ_URL`) and skip
-under `-short` or without Docker. Broker failures are injected with
-`testsupport/tcpproxy` between the relay and RabbitMQ.
+### Migrations
 
-## Worker simulator
-
-`cmd/worker` is a separate process. It consumes task events from
-`tenant.tasks.worker` and simulates provisioning. For each task it waits,
-publishes `in_progress`, waits again, and then publishes `done`, or
-`failed` with probability `--fail-rate`. It never touches PostgreSQL: its
-only output is the update messages. No real cloud resources are involved.
-
-```
- tenant.tasks.worker ──> TaskConsumer (prefetch 1, manual ack)
-                            │  decode + validate ── malformed ──> reject ──> tenant.dead-letter
-                            v
-                         Simulator.Process
-                            │  sleep [min,max] ─> publish in_progress ─┐  UpdatePublisher (own connection,
-                            │  sleep [min,max] ─> publish done|failed ─┤  confirms, persistent, mandatory)
-                            v                                          v
-                         ack (only now)                 tenant.task-updates ──> tenant.task-updates.control-plane
-```
-
-### Reliability contract (at-least-once)
-
-- A task is **acked only after both of its updates are broker-confirmed**.
-  A worker that crashes or is killed before that leaves the task unacked,
-  and RabbitMQ redelivers it, to this worker or another one.
-- A redelivered task is simulated again from the start and **republishes
-  updates with the same message IDs** (see below). Duplicates are
-  therefore expected, and the control plane discards them through its
-  `processed_updates` idempotency table.
-- **Processing failure** (for example, the update publish failed): the task
-  is requeued after a 1s pause, so a persistent failure cannot spin. The
-  quorum queue's delivery limit (20 in RabbitMQ 4) eventually
-  dead-letters a task that fails every time.
-- **Malformed message** (not JSON, unknown type, status other than
-  `accepted`, bad timestamp, `message_id` contradicting the body): it is
-  logged with a body excerpt and **rejected without requeue**. It goes to
-  `tenant.dead-letter` for inspection; it is not dropped and not retried
-  forever, and the consumer carries on with the next message.
-- **Broker unavailable or connection lost**: the consumer reconnects with
-  capped exponential backoff (500ms to 30s). Unacked deliveries return to
-  the queue in the meantime.
-- **Graceful shutdown** (SIGINT/SIGTERM): the worker stops taking new
-  deliveries. The in-flight task keeps running for up to
-  `--shutdown-timeout` (default 10s). If it finishes, it is acked. If not,
-  its context is cancelled and the task is requeued. Either way, nothing is
-  lost.
-- One task at a time per worker. To scale out, run more workers; they
-  compete for the same queue.
-
-### Update message schema
-
-JSON Schema: [`docs/schemas/task-update.v1.json`](docs/schemas/task-update.v1.json)
-(draft 2020-12). `messages_test.go` validates every encoded update against
-it, so the schema and the code cannot drift apart.
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `schema_version` | `1` | Bumped on an incompatible change. Unknown fields are ignored, so adding a field needs no new version. |
-| `message_id` | string, 1-200 | **Idempotency key.** `<task_id>:in_progress` or `<task_id>:outcome`. |
-| `task_id` | string | The task this update is about (the task event's `id`). |
-| `tenant_id`, `task_type` | string | Echo the task, so the consumer can check the update against its own record. |
-| `previous_status` | `accepted` \| `in_progress` | The status the worker moved the task from. |
-| `status` | `in_progress` \| `done` \| `failed` | The status it moved the task to. |
-| `reason` | string | Present only when `status` is `failed`. |
-| `occurred_at` | timestamp | When the transition happened (ISO 8601, ms, `Z`). |
-
-The schema also encodes the allowed transitions: `in_progress` requires
-`previous_status: accepted`, while `done` and `failed` require
-`previous_status: in_progress`. AMQP properties: `message_id` = the
-body's `message_id`, `correlation_id` = `task_id`, `type` = `task.update`,
-`app_id` = `tenant-worker`, `delivery_mode` = 2, routing key
-`task_update.<status>`.
-
-```json
-{"schema_version":1,"message_id":"6f1c...:in_progress","task_id":"6f1c...","tenant_id":"0b7e...",
- "task_type":"deploy","previous_status":"accepted","status":"in_progress","occurred_at":"2026-01-02T03:04:05.006Z"}
-{"schema_version":1,"message_id":"6f1c...:outcome","task_id":"6f1c...","tenant_id":"0b7e...",
- "task_type":"deploy","previous_status":"in_progress","status":"failed",
- "reason":"simulated deploy failure (fail rate 1)","occurred_at":"2026-01-02T03:04:06.210Z"}
-```
-
-**Why message IDs are derived from the task, not random.** A random ID
-per publish would give a redelivered task's updates fresh IDs, so the
-control plane could not tell them apart from new updates. Instead, each
-*logical* update has exactly one ID, which survives redelivery and worker
-restarts. The outcome has a single ID whether it is `done` or `failed`. If
-a rerun draws a different outcome, its update is a duplicate of the first
-outcome and is discarded: the first outcome recorded wins.
-
-### Running it: failure and success scenarios
-
-The worker reads `WORKER_*` variables (see `.env.example`), and CLI flags
-override them. Invalid values (fail rate outside [0,1] or NaN, a negative
-delay, min > max, delays above 1h, a malformed `RABBITMQ_URL`) stop the
-worker at startup, with every problem reported at once.
-
-```bash
-make up && make run-api                               # terminal 1
-
-# Every task fails:
-make run-worker WORKER_ARGS="--fail-rate=1"           # terminal 2
-curl -s -XPOST localhost:8080/v1/tenants -H 'content-type: application/json' \
-  -d '{"slug":"fail-demo","name":"Fail demo"}'
-# worker log: "task in progress" ..., then "task finished" status=failed reason="simulated deploy failure (fail rate 1)"
-
-# Reproduce success: stop the worker (Ctrl-C; the in-flight task finishes first),
-# restart it without failures and create another tenant:
-make run-worker WORKER_ARGS="--fail-rate=0"
-curl -s -XPOST localhost:8080/v1/tenants -H 'content-type: application/json' \
-  -d '{"slug":"ok-demo","name":"OK demo"}'
-# worker log: ... status=done
-
-# Inspect the updates without consuming them (management API, requeued):
-curl -s -u control_plane:local-dev-only -H 'content-type: application/json' \
-  -XPOST localhost:15672/api/queues/%2F/tenant.task-updates.control-plane/get \
-  -d '{"count":10,"ackmode":"ack_requeue_true","encoding":"auto"}'
-```
-
-Other knobs:
-- `--min-delay-ms` / `--max-delay-ms` set the range of each of the two waits;
-  `0`/`0` makes the worker instant.
-- `--seed=N` replays the same delays and outcomes for the same sequence of
-  tasks. The seed in use, random when unset, is logged at startup.
-- `--fail-rate=0.3` fails about 30% of tasks.
-- To exercise the dead-letter path, publish a malformed task in the management
-  UI (Exchanges > `tenant.tasks`, routing key `task.deploy`, payload
-  `not json`). It appears in `tenant.dead-letter` and the worker keeps
-  running.
-
-With `--fail-rate=1` the tenant ends `failed` (version 2); with
-`--fail-rate=0` it ends `active` (version 2). To replay duplicates, stale
-or conflicting updates by hand, see
-[Reproducing inbound scenarios](#reproducing-inbound-scenarios).
-
-### Tests
-
-| Behaviour | Test |
+| File | Adds |
 | --- | --- |
-| delay range (both bounds reachable, fixed, zero), real draws stay in range | `TestProcessDelays`, `TestProcessRealDelaysStayInRange`, `TestLoadWorker_DelayConfiguration` |
-| fail rate 0 never fails, 1 always fails, boundary, frequency, seed replay | `TestProcessFailRate`, `TestProcessSeedIsReproducible` |
-| lifecycle: in_progress then outcome, transitions follow the state machine, all task types | `TestProcessLifecycle`, `TestProcessAllTaskTypes`, `TestSimulatedLifecycleMatchesSchema` |
-| stable IDs across reruns, unique per logical update | `TestProcessStableIDs`, `TestWorkerRedeliveryRepeatsUpdateIDs` |
-| schema: encoded updates and events validate, the schema rejects invalid transitions, field names pinned | `messages_test.go` |
-| malformed task events are rejected / dead-lettered, not retried | `TestDecodeTaskMessageRejectsMalformed`, `TestWorkerDeadLettersMalformedMessages` |
-| ack only after publishing, requeue on failure | `TestWorkerReportsProgress`, `TestWorkerRequeuesFailedTask`, `TestProcessPublishFailure` |
-| graceful shutdown: in-flight task finishes, or is requeued after the timeout | `TestWorkerShutdownFinishesInFlightTask`, `TestWorkerShutdownTimeoutRequeuesTask`, `TestProcessCancelled` |
-| broker down at startup | `TestWorkerBrokerUnavailableAtStartup` |
-| configuration validation | `config_test.go` (`TestLoadWorker_*`) |
+| `00001_create_tenants.sql` | `tenants`, indexes for keyset pagination, version/identity trigger |
+| `00002_create_tasks.sql` | `tasks`, one-open-task index, terminal-freeze trigger |
+| `00003_create_outbox_events.sql` | `outbox_events` |
+| `00004_create_processed_updates.sql` | `processed_updates` |
+| `00005_add_outbox_delivery_state.sql` | lease, attempts, claim token and last error on the outbox |
 
-The simulator tests use a scripted random source and a fake clock and
-sleep, so they are deterministic and never wait. The `TestWorker*` tests run
-against a real RabbitMQ.
+- **Running them:** automatic. The api applies pending migrations on
+  startup (`postgres.Migrate`), each in its own transaction, under a
+  PostgreSQL advisory lock, so concurrent api starts are safe. The test
+  harness applies them the same way to every test database.
+- **Checking them:**
+  `docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select version_id, is_applied from goose_db_version order by id"'`
+- **Adding one:** create `migrations/0000N_description.sql` with
+  `-- +goose Up` / `-- +goose Down` sections. Never edit a committed
+  migration. Restart the api (`docker compose up -d --build api`) to apply
+  it. `TestMigrationsDownAndUpAgain` checks that down and up again work, and
+  `TestMigrateConcurrentCallers` that concurrent starts are safe.
+- **Starting over:** `make clean && make up` drops the volume and
+  re-applies everything.
 
-## Inbound messaging
+---
 
-The control plane consumes the worker's progress updates from
-`tenant.task-updates.control-plane` (`rabbitmq.UpdateConsumer`) and
-applies each one with `TaskService.ApplyUpdate`.
+## 7. HTTP API
 
-```
- tenant.task-updates.control-plane ──> UpdateConsumer (prefetch N, N handlers, manual ack)
-        │                                 │ decode + validate (task-update.v1.json)
-        │                                 │     └── malformed ─────────────────────────> reject ──> tenant.dead-letter
-        │                                 v
-        │                    ApplyUpdate, one PostgreSQL transaction:
-        │                      1. INSERT message_id INTO processed_updates  (seen before: duplicate)
-        │                      2. SELECT task FOR UPDATE; check tenant_id, task_type
-        │                      3. advance task  (reached or passed: stale / conflict)
-        │                      4. terminal: move tenant, version + 1 (optimistic lock)
-        │                    COMMIT
-        │                                 │
-        │                                 ├── ok (applied, duplicate, stale, conflict) ──> ack
-        │                                 ├── permanent (task not found, mismatch) ─────> reject ──> tenant.dead-letter
-        └──── requeue <── MaxAttempts ────┴── retryable (DB down, timeout) ──> backoff, retry in-process
-```
+JSON in and out. Request bodies need `Content-Type: application/json`.
+Timestamps are ISO 8601 UTC with milliseconds (`2026-10-14T20:47:52.459Z`).
+Every response carries an `X-Request-ID`. A valid client-supplied one is
+echoed back; otherwise one is generated.
 
-### At-least-once delivery, idempotent consumer
+| Method | Path | Description | Success |
+| --- | --- | --- | --- |
+| GET | `/healthz` | Liveness | 200 |
+| POST | `/v1/tenants` | Create a tenant and its `deploy` task | 201 + `Location: /v1/tenants/{id}` |
+| GET | `/v1/tenants` | List tenants (`status`, `limit`, `cursor`) | 200 |
+| GET | `/v1/tenants/{tenantID}` | Get a tenant (destroyed tenants included) | 200 |
+| PATCH | `/v1/tenants/{tenantID}` | Partial update (`name`) with `version`; creates an `update` task | 202 + `Location: /v1/tasks/{id}` |
+| DELETE | `/v1/tenants/{tenantID}` | Request destruction; creates a `destroy` task | 202 + `Location: /v1/tasks/{id}` |
+| GET | `/v1/tasks` | List tasks (`tenant_id`, `status`, `limit`, `cursor`) | 200 |
+| GET | `/v1/tasks/{taskID}` | Get a task | 200 |
 
-**This is not exactly-once processing, and it does not try to be.** The
-broker delivers each update *at least* once. The worker republishes
-updates when a task is redelivered to it, the broker redelivers anything
-unacked when a consumer dies, and the ack itself can be lost. What the
-consumer guarantees is that *applying* an update is idempotent. However
-many times an update arrives, and in whatever order, the database ends
-in the state it would reach if each logical update had arrived exactly
-once, in order. That is "effectively once" for the state, not once for
-the message.
-
-It rests on three things:
-
-1. **A stable idempotency key.** `message_id` is derived from the task
-   (`<task_id>:in_progress`, `<task_id>:outcome`), so every copy of a
-   logical update carries the same key (see
-   [why](#update-message-schema)).
-2. **The key and the effect commit together.** `processed_updates` is
-   written in the same transaction as the task and tenant changes. A key
-   is recorded if and only if its effect is. If the transaction rolls
-   back, the key goes with it, and a retry is applied rather than skipped.
-   Concurrent deliveries of one key block on the primary key: one commits,
-   and the others see `duplicate`.
-3. **Ack after commit.** A delivery is acked only after `ApplyUpdate`
-   returns. The one window left is a crash after the commit and before
-   the ack, and it is harmless: the broker redelivers, the key is already
-   there, and the redelivery is acked as `duplicate` with no further
-   change.
-
-Deduplication by key alone is not enough, because two *different* keys
-can describe the same or contradicting progress (a hand-published update,
-or a worker of another version). So the state machine is a second line of
-defence:
-
-| Situation | Outcome | Effect |
-| --- | --- | --- |
-| first delivery of a valid update | `applied` | task advances; on `done`/`failed` the tenant moves and its version increments |
-| same `message_id` again | `duplicate` | none |
-| task already at or past the status (`in_progress` after `done`, `done` twice) | `stale` | none, key recorded |
-| terminal outcome contradicting the recorded one (`failed` after `done`) | `conflict` | none, key recorded, logged as a warning: the first outcome wins |
-| outcome overtakes its `in_progress` | `applied` | task steps `accepted -> in_progress -> done` in one transaction; the late `in_progress` is then `stale` |
-| update for a terminal task after its tenant moved on | `stale` | none; the tenant is not dragged back |
-
-Behind that, the database refuses regressions on its own: a trigger
-freezes terminal tasks, another forces every tenant write to increment
-`version` by exactly one, and a partial unique index allows only one open
-task per tenant. Outcome mapping: deploy `done` -> `active`, update
-`done` -> `active`, destroy `done` -> `destroyed`, any `failed` ->
-`failed`.
-
-### Settling a delivery
-
-| Result | Settlement | Why |
-| --- | --- | --- |
-| applied, duplicate, stale, conflict | **ack** | dealt with; the database is in its final state |
-| malformed (not JSON, unknown `schema_version`, illegal transition, `message_id`/`correlation_id` disagreeing with the body, bad timestamp, ...) | **reject -> `tenant.dead-letter`** | no redelivery can make it valid |
-| permanent: task not found, `tenant_id`/`task_type` not matching the task, tenant not expecting the outcome | **reject -> `tenant.dead-letter`** | retrying cannot fix it; key not recorded, so it can be replayed once fixed |
-| retryable: lost connection, timeout, version conflict, anything unrecognised | **retry in-process** with backoff (`INBOUND_RETRY_MIN` doubling to `INBOUND_RETRY_MAX`) | an outage is not the message's fault |
-| still retryable after `INBOUND_MAX_ATTEMPTS`, or shutting down | **nack, requeue** | do not hold a slot forever |
-
-**Poison-message policy for an unknown task: dead-letter it at once.**
-Tasks are committed before their event is published (outbox), and the
-worker only reports on tasks it received. So "task not found" is never a
-race that a retry would win. The message comes from another environment,
-was published by hand, or refers to a database restored from an older
-backup. Acking it would hide the problem, and retrying would spin. In
-the dead-letter queue it can be inspected, and once the cause is fixed,
-republished to `tenant.task-updates`. Replay is safe, because the
-consumer is idempotent.
-
-**No infinite loops.** Every retry waits (capped exponential backoff).
-After `INBOUND_MAX_ATTEMPTS` the delivery is requeued, so other updates
-get through. The quorum queue's delivery limit (20 in RabbitMQ 4) is the
-final bound: a message that fails on every delivery is dead-lettered with
-reason `delivery_limit`. With the defaults that takes about 14 minutes of
-continuous failure. A longer database outage parks the affected messages
-in `tenant.dead-letter` rather than losing them, and they can be replayed.
-
-### Crash windows
-
-| Crash point | What happens |
-| --- | --- |
-| before the commit | transaction rolls back (key included); delivery unacked, redelivered, applied |
-| after the commit, before the ack | redelivered; key found; acked as `duplicate`; tenant changed once (`TestInboundCrashAfterCommitBeforeAck`) |
-| commit outcome unknown (connection lost during `COMMIT`) | retried; either applied now or found as `duplicate` |
-| after the ack | nothing left to do |
-
-### Concurrency and shutdown
-
-- `INBOUND_CONCURRENCY` handlers (default 4) share one channel with that
-  prefetch. Several control-plane processes can consume the same queue.
-  Updates for one task are serialized by the task row lock
-  (`SELECT ... FOR UPDATE`), and the tenant write is version-checked.
-- Shutdown (SIGINT/SIGTERM): the consumer stops taking deliveries. Updates
-  being applied get `INBOUND_SHUTDOWN_TIMEOUT` (default 10s) to commit and
-  ack, and a retry backoff in progress is cut short and its delivery
-  requeued. Closing the connection then returns every unsettled delivery
-  to the queue.
-- A lost broker connection is re-established with capped backoff; unacked
-  deliveries are redelivered meanwhile.
-
-### Reproducing inbound scenarios
-
-With `make up`, `make run-api` and `make run-worker` running, create a
-tenant and let it reach `active`. Then publish updates directly to the
-broker through the management API:
-
-```bash
-TENANT=$(curl -s -XPOST localhost:8080/v1/tenants -H 'content-type: application/json' \
-  -d '{"slug":"replay-demo","name":"Replay demo"}' | jq -r .tenant.id)
-sleep 5   # let the worker finish: two waits of 0.5-2s each by default
-TASK=$(curl -s "localhost:8080/v1/tasks?tenant_id=$TENANT" | jq -r '.items[0].id')
-
-# publish <message_id> <task_id> <previous_status> <status> [reason]
-publish() {
-  jq -nc --arg id "$1" --arg task "$2" --arg tenant "$TENANT" --arg prev "$3" --arg st "$4" --arg reason "${5:-}" '
-    {schema_version:1, message_id:$id, task_id:$task, tenant_id:$tenant, task_type:"deploy",
-     previous_status:$prev, status:$st, occurred_at:"2026-01-01T00:00:00.000Z"}
-    + (if $reason == "" then {} else {reason:$reason} end)
-    | {properties:{message_id:$id, content_type:"application/json", delivery_mode:2},
-       routing_key:"task_update.manual", payload:tojson, payload_encoding:"string"}' |
-  curl -s -u control_plane:local-dev-only -H 'content-type: application/json' \
-    -XPOST localhost:15672/api/exchanges/%2F/tenant.task-updates/publish -d @-
-}
-
-publish "$TASK:outcome"  "$TASK" in_progress done            # duplicate: "duplicate task update ignored"
-publish manual-stale-1   "$TASK" accepted    in_progress      # stale:     "stale task update ignored"
-publish manual-conflict  "$TASK" in_progress failed "late"    # conflict:  WARN "conflicting task outcome ignored"
-publish manual-ghost "$(uuidgen | tr A-Z a-z)" in_progress done   # unknown task: dead-lettered
-curl -s -u control_plane:local-dev-only -H 'content-type: application/json' -XPOST \
-  localhost:15672/api/exchanges/%2F/tenant.task-updates/publish \
-  -d '{"properties":{"message_id":"garbage-1"},"routing_key":"task_update.x","payload":"not json","payload_encoding":"string"}'
-                                                              # malformed: dead-lettered
-
-curl -s localhost:8080/v1/tenants/$TENANT                     # still active, version 2
-
-# Inspect the dead letters (requeued, so they stay):
-curl -s -u control_plane:local-dev-only -H 'content-type: application/json' \
-  -XPOST localhost:15672/api/queues/%2F/tenant.dead-letter/get \
-  -d '{"count":10,"ackmode":"ack_requeue_true","encoding":"auto"}' | jq '.[] | {id: .properties.message_id, reason: .properties.headers["x-first-death-reason"]}'
-```
-
-To see a transient database failure, stop PostgreSQL (`docker compose stop
-postgres`) while a tenant is provisioning. The API logs "applying task
-update failed, retrying" with growing delays. After `docker compose start
-postgres` the update is applied, and nothing is dead-lettered.
-
-### Tests
-
-| Behaviour | Test |
-| --- | --- |
-| duplicate delivery: applied once, repeats acked as duplicates, nothing changes | `TestInboundDuplicateDelivery`, `TestApplyUpdateDuplicateChangesNothing`, `TestAppConcurrentDuplicateUpdates` |
-| stale delivery: late `in_progress` after `done`, outcome before `in_progress` | `TestInboundStaleDelivery`, `TestApplyUpdate`, `TestApplyUpdateOutOfOrder` |
-| terminal-state protection: duplicate, conflicting and late outcomes; tenant not regressed after moving on | `TestInboundTerminalProtection`, `TestApplyUpdate` (stale/conflict rows) |
-| task not found and tenant/type mismatch: dead-lettered after one attempt, nothing recorded | `TestInboundTaskNotFound`, `TestConsumerDeadLettersPermanentFailures`, `TestApplyUpdateRejectsWithoutPartialMutation` |
-| transient database failure: retried with backoff, applied when the database is back, nothing dead-lettered | `TestInboundTransientDatabaseFailure`, `TestConsumerRetriesTransientFailures`, `TestConsumerRequeuesAfterMaxAttempts` |
-| bounded retries: a message failing forever is dead-lettered by the delivery limit | `TestConsumerFailingForeverIsBounded` |
-| malformed messages: decoder agrees with the JSON Schema; dead-lettered with reason `rejected` | `TestDecodeTaskUpdateMessageAgreesWithSchema`, `TestDecodeTaskUpdateMessageChecksProperties`, `TestConsumerDeadLettersMalformedUpdates` |
-| concurrent deliveries: two consumers x 4 handlers, every update 3 times, racing outcomes | `TestInboundConcurrentDeliveries`, `TestConsumerAppliesConcurrently`, `TestAppConcurrentDistinctUpdates` |
-| crash after commit, before ack: redelivered, duplicate, tenant changed once | `TestInboundCrashAfterCommitBeforeAck` |
-| graceful shutdown: in-flight update finishes; timeout and backoff requeue | `TestConsumerShutdownFinishesInFlightUpdate`, `TestConsumerShutdownTimeoutRequeues`, `TestConsumerShutdownDuringBackoff` |
-| broker down at startup, connection lost | `TestConsumerReconnects` |
-| outcome mapping and version increments, through the API | `TestInboundLifecycle` |
-| whole system: API -> outbox -> worker -> consumer, fail rate 0 and 1 | `TestInboundFullLoop` |
-| error classification | `TestIsPermanentUpdateError` |
-
-To check the tests catch real bugs, I broke 14 safeguards one at a time
-(acking before applying, requeueing malformed messages, retrying
-permanent failures, dead-lettering transient ones, no backoff, unbounded
-attempts, no shutdown grace, a single handler, treating every error as
-permanent, ignoring the idempotency key, skipping the tenant/type check,
-merging conflict into stale, not moving the tenant, and dropping a
-decoder rule). Each one made at least one test fail.
-
-### Trade-offs and limits
-
-- **Dead-lettering is at-most-once in RabbitMQ by default.** If the
-  dead-letter queue could not accept a message, the broker would drop it.
-  The at-least-once dead-letter strategy needs `x-overflow: reject-publish`
-  on the source queue, and changing the arguments of an existing queue
-  forces it to be recreated. Worth doing in production; not done here.
-- **Head-of-line blocking is bounded, not eliminated.** A retrying update
-  holds one of `INBOUND_CONCURRENCY` slots for up to `INBOUND_MAX_ATTEMPTS`
-  attempts before it is requeued.
-- **`processed_updates` grows without bound.** Keys are small, and a key
-  only needs to outlive any redelivery of its message, so a periodic
-  `DELETE ... WHERE processed_at < now() - interval '30 days'` would be
-  safe. It is not implemented.
-- **The first terminal outcome wins.** A conflicting late outcome is
-  logged, not applied. A real system might also raise an alert.
-
-## Concurrency and recovery checks
-
-The integration tests run against real PostgreSQL and RabbitMQ
-(testcontainers, or `TEST_DATABASE_URL` / `TEST_RABBITMQ_URL`); they skip
-only under `-short` or when Docker is unreachable.
-
-| Behaviour | Test |
-| --- | --- |
-| same-slug creates: one 201, every loser `tenant_already_exists`, nothing left behind | `TestConcurrentCreatesWithSameSlug`, `TestAppConcurrentCreatesSameSlug` |
-| same-version PATCHes: one 202, every loser `tenant_version_conflict`, one update task | `TestConcurrentPatchesWithSameVersion`, `TestAppConcurrentUpdatesSameVersion` |
-| PATCH or DELETE from every disallowed status, `destroyed` included | `TestInvalidStateTransitions` |
-| deploy, update and destroy failures -> `failed`, then DELETE -> `destroyed` | `TestFailureOutcomes` |
-| deploy observed step by step: `in_progress` moves the task only, `done` the tenant | `TestInboundDeployStepByStep` |
-| relay crashes after publishing: the worker runs the task twice, the domain state is as if once | `TestRecoveryPublisherCrashRedelivery` |
-| control-plane restart: same tenants, pending outbox events published and completed, the stale rerun of a pre-restart event changes nothing | `TestRecoveryRestart` |
-| rollback leaves no tenant, task or outbox row | `TestAppMutationsRollBack`, `TestWithinTxRollsBack` |
-
-`make stress` repeats every `*Concurrent*` test `STRESS_COUNT` times
-(default 20) under the race detector, to shake out interleavings a
-single run misses.
-
-`make race-check` exercises the running system instead. With
-`make run-api` and `make run-worker WORKER_ARGS="--fail-rate=0"` running,
-each round fires `-n` simultaneous creates with one slug, then PATCHes
-with one version, then DELETEs, and checks that exactly one of each wins,
-the losers get the documented error codes, the worker's outcomes bump the
-version (2, 4, 6), exactly three tasks exist, and the destroyed slug stays
-taken. It exits 1 on any violation.
-
-```bash
-make race-check RACECHECK_ARGS="-n 64 -rounds 5"
-# round 1 (rc-mv8kc2ti-0): ok
-# ...
-# all 5 rounds passed with 64 concurrent requests per step
-```
-
-## HTTP API
-
-All endpoints speak JSON. Request bodies must be sent with
-`Content-Type: application/json`. Timestamps are ISO 8601 UTC with
-milliseconds, e.g. `2026-01-02T03:04:05.006Z`.
-
-| Method | Path                     | Description                              | Success |
-| ------ | ------------------------ | ---------------------------------------- | ------- |
-| GET    | `/healthz`               | Liveness (process is serving HTTP)       | 200     |
-| POST   | `/v1/tenants`            | Create a tenant and its `deploy` task    | 201     |
-| GET    | `/v1/tenants`            | List tenants                             | 200     |
-| GET    | `/v1/tenants/{tenantID}` | Get a tenant                             | 200     |
-| PATCH  | `/v1/tenants/{tenantID}` | Partially update; creates an `update` task | 202   |
-| DELETE | `/v1/tenants/{tenantID}` | Destroy; creates a `destroy` task        | 202     |
-| GET    | `/v1/tasks`              | List tasks                               | 200     |
-| GET    | `/v1/tasks/{taskID}`     | Get a task                               | 200     |
-
-Tasks are read-only over HTTP. They are created only by tenant calls and
-driven only by the worker.
-
-### Resources
-
-```jsonc
-// Tenant
-{ "id": "7ca4199d-…", "slug": "acme", "name": "Acme", "status": "active",
-  "version": 2, "created_at": "2026-10-14T18:24:01.434Z", "updated_at": "2026-10-14T18:24:03.101Z" }
-
-// Task
-{ "id": "7b29519c-…", "type": "deploy", "tenant_id": "7ca4199d-…", "status": "done",
-  "created_at": "2026-10-14T18:24:01.434Z", "updated_at": "2026-10-14T18:24:03.101Z" }
-```
-
-The JSON models are separate types built from the domain model field by
-field. Database rows and internal fields are never serialized directly.
-
-POST, PATCH and DELETE all return the tenant after the change together with
-the task that tracks the asynchronous work:
-
-```json
-{ "tenant": { …tenant… }, "task": { …task… } }
-```
+PATCH and DELETE return **202 Accepted**: the change is recorded, but the
+work it triggers is asynchronous. Tasks are read-only over HTTP.
 
 ### Create
 
 ```bash
-curl -si localhost:8080/v1/tenants -H 'Content-Type: application/json' \
+curl -si -XPOST localhost:8080/v1/tenants -H 'Content-Type: application/json' \
   -d '{"slug":"acme","name":"Acme"}'
-# 201 Created, Location: /v1/tenants/<id>
-# tenant.status = "provisioning", tenant.version = 1, task.type = "deploy", task.status = "accepted"
 ```
 
-Both fields are required:
+```http
+HTTP/1.1 201 Created
+Location: /v1/tenants/03784000-31c3-4f59-b759-3a0e0c322eaa
+X-Request-Id: cffe4696-ad17-4a3f-a4ac-94544ebde9ba
+```
 
-- `slug`: 3-28 characters matching `^[a-z][-a-z0-9]{1,26}[a-z0-9]$`. It is
-  unique forever: a destroyed tenant keeps its slug.
-- `name`: must not be blank.
+```json
+{
+  "tenant": { "id": "03784000-31c3-4f59-b759-3a0e0c322eaa", "slug": "acme", "name": "Acme",
+              "status": "provisioning", "version": 1,
+              "created_at": "2026-10-14T20:47:52.459Z", "updated_at": "2026-10-14T20:47:52.459Z" },
+  "task":   { "id": "c70d3375-ec3e-46e2-9330-ac3137be4db3", "type": "deploy",
+              "tenant_id": "03784000-31c3-4f59-b759-3a0e0c322eaa", "status": "accepted",
+              "created_at": "2026-10-14T20:47:52.459Z", "updated_at": "2026-10-14T20:47:52.459Z" }
+}
+```
 
-Any other field is rejected.
+- `slug` must be 3-28 characters matching `^[a-z][-a-z0-9]{1,26}[a-z0-9]$`.
+  It is unique forever, so a destroyed tenant keeps its slug.
+- `name` must not be blank.
+- Any other field is rejected with `400`.
 
-### Update (PATCH) and optimistic locking
+### Get and list
 
 ```bash
-curl -si -X PATCH localhost:8080/v1/tenants/<id> -H 'Content-Type: application/json' \
-  -d '{"name":"Acme Corp","version":2}'
-# 202 Accepted, Location: /v1/tasks/<update task id>
+curl -s localhost:8080/v1/tenants/03784000-31c3-4f59-b759-3a0e0c322eaa
 ```
 
-- **Partial semantics.** Omitted fields are left unchanged. `null` is
-  rejected, because no patchable field can be cleared. At least one field
-  must be given. The only patchable field is `name`. The slug is immutable,
-  so sending it is an "unsupported field" error.
-- **`version` is required.** It is the `version` the client last read.
-  Every mutation increments it, including status changes applied by the
-  worker. If the tenant has changed since that read, the PATCH fails with
-  `409 tenant_version_conflict` and changes nothing. The client should GET
-  the tenant again and retry. The check is enforced by a conditional write
-  (`UPDATE … WHERE version = $n`), so of two concurrent PATCHes carrying the
-  same version, at most one succeeds.
-- The expected version goes in the body rather than an `If-Match` header.
-  That keeps the precondition visible in the same JSON document as the
-  change, and the brief's `tenant_version_conflict` maps naturally to 409.
-- **Order of checks:** the version is checked before the status. A stale
-  version gives `tenant_version_conflict`. A current version on a tenant
-  that is not `active` gives `tenant_update_not_allowed`.
-- On success the tenant becomes `updating` with an `update` task. It returns
-  to `active` (or `failed`) when the worker reports the outcome.
+```json
+{ "id": "03784000-31c3-4f59-b759-3a0e0c322eaa", "slug": "acme", "name": "Acme", "status": "active",
+  "version": 2, "created_at": "2026-10-14T20:47:52.459Z", "updated_at": "2026-10-14T20:47:55.466Z" }
+```
+
+```bash
+curl -s 'localhost:8080/v1/tasks?tenant_id=03784000-31c3-4f59-b759-3a0e0c322eaa'
+```
+
+```json
+{ "items": [ { "id": "c70d3375-ec3e-46e2-9330-ac3137be4db3", "type": "deploy",
+               "tenant_id": "03784000-31c3-4f59-b759-3a0e0c322eaa", "status": "done",
+               "created_at": "2026-10-14T20:47:52.459Z", "updated_at": "2026-10-14T20:47:55.466Z" } ] }
+```
+
+Pagination and filtering (both lists):
+
+```bash
+curl -s 'localhost:8080/v1/tenants?status=active&limit=20'
+curl -s 'localhost:8080/v1/tenants?limit=20&cursor=<next_cursor from the previous page>'
+curl -s 'localhost:8080/v1/tasks?tenant_id=<id>&status=in_progress'
+```
+
+| Parameter | Endpoints | Meaning |
+| --- | --- | --- |
+| `limit` | both | page size 1-200, default 50 |
+| `cursor` | both | opaque `next_cursor` from the previous page; `next_cursor` is omitted on the last page |
+| `status` | both | exact match; must be a valid status of that resource |
+| `tenant_id` | `/v1/tasks` | tasks of one tenant; an unknown tenant gives an empty list |
+
+- Lists are oldest first. Pagination is keyset-based (`created_at, id`),
+  so pages stay stable while rows are inserted.
+- Filters combine with AND.
+- Unknown or repeated parameters, an out-of-range `limit`, an invalid
+  `status` or a malformed `cursor` give `400 invalid_request`. A typo is
+  rejected rather than silently ignored.
+
+### Update (PATCH)
+
+```bash
+curl -si -XPATCH localhost:8080/v1/tenants/03784000-31c3-4f59-b759-3a0e0c322eaa \
+  -H 'Content-Type: application/json' -d '{"name":"Acme Corp","version":2}'
+```
+
+```http
+HTTP/1.1 202 Accepted
+Location: /v1/tasks/9285becc-2307-4469-98dd-29ec1cd96b7f
+```
+
+```json
+{ "tenant": { "id": "03784000-…", "slug": "acme", "name": "Acme Corp", "status": "updating", "version": 3, "…": "…" },
+  "task":   { "id": "9285becc-2307-4469-98dd-29ec1cd96b7f", "type": "update", "status": "accepted", "…": "…" } }
+```
+
+- `version` is required. See [Optimistic locking](#9-optimistic-locking).
+- `name` is the only patchable field. Omitted fields are unchanged, and
+  `null` is rejected. `slug` is immutable, so sending it gives `400`.
 
 ### Delete
 
 ```bash
-curl -si -X DELETE localhost:8080/v1/tenants/<id>
-# 202 Accepted, Location: /v1/tasks/<destroy task id>
+curl -si -XDELETE localhost:8080/v1/tenants/03784000-31c3-4f59-b759-3a0e0c322eaa
 ```
 
-DELETE **requests** destruction; it does not remove anything synchronously:
+```http
+HTTP/1.1 202 Accepted
+Location: /v1/tasks/8e78c62f-d9d9-4644-8a30-c3c9440ab3bd
+```
 
-- It is allowed only from `active` or `failed`. The tenant becomes
-  `destroying` and a `destroy` task is created and published to the worker.
-- When the worker reports the destroy as `done`, the tenant becomes
-  `destroyed`. If it reports `failed`, the tenant becomes `failed`, and
-  DELETE can be retried from there.
-- The tenant record is **kept** (soft delete). `GET /v1/tenants/{id}` keeps
-  returning it with `status: "destroyed"`, not 404, so its history and tasks
-  remain traceable. Its slug is never reusable.
-- DELETE on a tenant that is `provisioning`, `updating`, `destroying` or
-  already `destroyed` returns `409 tenant_update_not_allowed`. Repeating a
-  DELETE therefore never creates a second destroy task.
-- DELETE takes no body and no expected version. It is still a conditional
-  write, so if the tenant changes between the read and the write (for
-  example, a racing PATCH), it fails with `409 tenant_version_conflict`.
+```json
+{ "tenant": { "…": "…", "status": "destroying", "version": 5 },
+  "task":   { "…": "…", "type": "destroy", "status": "accepted" } }
+```
 
-Track progress with `GET /v1/tasks/{taskID}` (the `Location` header) or
-`GET /v1/tenants/{tenantID}`.
+DELETE **requests** destruction. It is allowed from `active` or `failed`.
+The row is kept: after the worker reports `done` the tenant reads as
+`destroyed`, and GET still returns it rather than 404. Repeating a DELETE
+gets `409 tenant_update_not_allowed` and never creates a second destroy
+task.
 
-### Listing: pagination and filtering
+---
+
+## 8. Errors and HTTP status mapping
+
+Every error, including unknown routes, wrong methods and recovered panics,
+has one shape:
+
+```json
+{ "error": { "code": "invalid_request", "message": "invalid slug: must be 3-28 characters, got 1", "field": "slug" } }
+```
+
+`code` is the stable contract to branch on. `message` is for humans.
+`field` is present when one body field or query parameter is at fault.
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `invalid_request` | 400 | malformed JSON; missing, null, mistyped or unknown field; invalid slug or name; missing `version`; bad query parameter |
+| `tenant_not_found` | 404 | no tenant with that ID (a malformed ID too) |
+| `task_not_found` | 404 | no task with that ID |
+| `route_not_found` | 404 | no such path |
+| `method_not_allowed` | 405 | path exists, method does not (the `Allow` header lists valid ones) |
+| `tenant_already_exists` | 409 | slug taken, including by a destroyed tenant, or lost a concurrent same-slug create |
+| `tenant_update_not_allowed` | 409 | PATCH or DELETE not allowed in the tenant's current status |
+| `tenant_version_conflict` | 409 | the `version` sent is stale, or the tenant changed between read and write |
+| `payload_too_large` | 413 | body over 1 MiB |
+| `unsupported_media_type` | 415 | body not sent as `application/json` |
+| `internal_error` | 500 | anything unexpected; details are logged with the request ID, never returned |
+| `request_timeout` | 503 | the request exceeded `HTTP_REQUEST_TIMEOUT` |
+
+Real responses from the running stack:
+
+```text
+POST  same slug again              -> 409 {"error":{"code":"tenant_already_exists","message":"tenant already exists"}}
+PATCH with version 1 (current: 2)  -> 409 {"error":{"code":"tenant_version_conflict","message":"tenant version conflict"}}
+PATCH while updating               -> 409 {"error":{"code":"tenant_update_not_allowed","message":"tenant update not allowed in current status"}}
+GET   /v1/tenants/<unknown uuid>   -> 404 {"error":{"code":"tenant_not_found","message":"tenant not found"}}
+GET   /v1/tasks/nope               -> 404 {"error":{"code":"task_not_found","message":"task not found"}}
+```
+
+The three 409s share a status because each means "conflicts with the
+tenant's current state"; the code tells them apart. The whole mapping is
+one function, `classify` in
+[`internal/adapters/httpapi/errors.go`](internal/adapters/httpapi/errors.go).
+
+---
+
+## 9. Optimistic locking
+
+Every tenant write is a conditional update:
+
+```sql
+UPDATE tenants SET ..., version = version + 1 WHERE id = $1 AND version = $2
+```
+
+Zero rows affected means someone else wrote first, and the call fails with
+`409 tenant_version_conflict`. No change is made and no task or outbox row
+is written, because the whole call is one transaction.
+
+- **Every mutation bumps `version`**: create (1), PATCH, DELETE, and every
+  tenant change applied from a worker outcome. A database trigger rejects
+  any update that does not increase it by exactly one, whoever the writer
+  is.
+- **PATCH takes the expected version in the body.** The client sends the
+  `version` it last read. If the worker has finished a task since then,
+  the version has moved, and the client must re-read before patching.
+  That is deliberate: the client was looking at a stale state.
+- **Order of checks:** version first, then status. A stale version gives
+  `tenant_version_conflict`. A current version on a non-`active` tenant
+  gives `tenant_update_not_allowed`.
+- **Concurrency:** of N simultaneous PATCHes carrying the same version,
+  exactly one gets `202` and the rest get `409 tenant_version_conflict`.
+  This is proven by `TestConcurrentPatchesWithSameVersion` (HTTP + real
+  PostgreSQL), `TestAppConcurrentUpdatesSameVersion`, and `make race-check`
+  against the live stack.
+- **DELETE** takes no version from the client, but it is still a
+  conditional write on the version it just read. A DELETE racing a PATCH
+  or another DELETE can therefore get `tenant_version_conflict` rather
+  than `tenant_update_not_allowed`. Both mean "re-read and decide".
+- **Worker-applied changes** use the same version check, under the task's
+  row lock.
+
+---
+
+## 10. Messaging: outbox, topology and message formats
+
+### Outbound: transactional outbox
+
+Every state-changing API call publishes exactly one event, and only after
+the change is durably committed:
+
+```
+ HTTP request
+     └─ TenantService ── one transaction ──────────────────────────┐
+           INSERT/UPDATE tenants                                   │
+           INSERT tasks                                            │
+           INSERT outbox_events (task_id, status snapshot)         │
+        COMMIT ────────────────────────────────────────────────────┘  -> 201/202 to the client
+
+ OutboxRelay (background, one per api replica)
+     1. claim    UPDATE outbox_events SET available_at = now()+lease, claim_token = ...
+                 WHERE published_at IS NULL AND available_at <= now() ... FOR UPDATE SKIP LOCKED   (own committed statement)
+     2. publish  -> tenant.tasks, wait for the publisher confirm   (no transaction open)
+     3. mark     UPDATE outbox_events SET published_at = now()       (only after the confirm)
+        failure: attempts+1, last_error, available_at = now()+backoff
+```
+
+Why an outbox: the database and the broker share no transaction.
+
+| Approach | Failure | Result |
+| --- | --- | --- |
+| publish, then commit | commit fails or the process dies | the worker provisions a tenant that does not exist |
+| commit, then publish in the request | broker down, or the process dies after commit | event lost; tenant stuck in `provisioning` forever |
+| **outbox** | anything | the event exists if and only if the change committed, and is retried until the broker confirms it |
+
+Properties:
+
+- **Rollback leaves nothing.** The outbox row is in the same transaction
+  as the tenant and task (`TestAppMutationsRollBack`).
+- **Only committed rows are visible.** The claim runs under READ
+  COMMITTED, and it selects by `published_at IS NULL` rather than "id
+  above the last one seen", so a late-committing transaction is not
+  skipped.
+- **No transaction is held while talking to the broker.** The lease
+  (`OUTBOX_LEASE`) keeps other relays off a claimed row. If the relay
+  dies, the lease expires and the row is claimed again
+  (`TestOutboxAbandonedClaimIsRedelivered`).
+- **Several relays are safe.** `SKIP LOCKED` plus the lease keeps
+  concurrent claims disjoint (`TestOutboxConcurrentRelays`). Lease and
+  retry times use the database clock.
+- **Nothing is discarded.** Retries use exponential backoff with jitter
+  (`OUTBOX_RETRY_MIN`..`MAX`), with no attempt limit. Stuck events show up
+  with `SELECT task_id, attempts, last_error FROM outbox_events WHERE published_at IS NULL`.
+- **Broker down at startup is fine.** The api serves requests, events
+  accumulate, and they are published once the broker is reachable.
+
+**Still at-least-once.** A crash between the confirm and the mark, a lost
+confirm, or an expired lease re-publishes the event. Every copy is
+byte-identical, and the task ID is the AMQP `message_id`, so consumers
+deduplicate (see [§11](#11-inbound-updates-idempotency-and-ordering) and
+[§12](#12-worker-simulator)).
+
+### Broker topology
+
+| Object | Name | Properties |
+| --- | --- | --- |
+| Exchange | `tenant.tasks` | topic, durable; routing key `task.<type>` |
+| Queue | `tenant.tasks.worker` | quorum, bound `task.#`, dead-letters to `tenant.dead-letter` |
+| Exchange | `tenant.task-updates` | topic, durable; routing key `task_update.<status>` |
+| Queue | `tenant.task-updates.control-plane` | quorum, bound `task_update.#`, dead-letters to `tenant.dead-letter` |
+| Exchange + queue | `tenant.dead-letter` | fanout + quorum queue: rejected messages and messages over the delivery limit (20) |
+
+Both processes declare the whole topology on every connect, so start
+order does not matter. Messages are persistent and published with
+`mandatory` and publisher confirms.
+
+### Task event (control plane → worker)
+
+AMQP `message_id` = task ID, `type` = `task`, `app_id` =
+`tenant-control-plane`, `delivery_mode` = 2. The body is the task as
+committed (schema:
+[`docs/schemas/task-event.v1.json`](docs/schemas/task-event.v1.json)):
+
+```json
+{ "id": "c70d3375-ec3e-46e2-9330-ac3137be4db3", "type": "deploy",
+  "tenant_id": "03784000-31c3-4f59-b759-3a0e0c322eaa", "status": "accepted",
+  "created_at": "2026-10-14T20:47:52.459Z", "updated_at": "2026-10-14T20:47:52.459Z" }
+```
+
+### Progress update (worker → control plane)
+
+Schema: [`docs/schemas/task-update.v1.json`](docs/schemas/task-update.v1.json).
+`messages_test.go` validates every encoded update against it.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | `1` |
+| `message_id` | **idempotency key**: `<task_id>:in_progress` or `<task_id>:outcome` |
+| `task_id` | the task this update is about |
+| `tenant_id`, `task_type` | echo the task, so the consumer can check the update against its record |
+| `previous_status` → `status` | `accepted → in_progress`, or `in_progress → done \| failed` (the schema enforces these pairs) |
+| `reason` | only on `failed` |
+| `occurred_at` | ISO 8601, ms, `Z` |
+
+AMQP `message_id` = body `message_id`, `correlation_id` = `task_id`.
+
+```json
+{"schema_version":1,"message_id":"c70d…:in_progress","task_id":"c70d…","tenant_id":"0378…",
+ "task_type":"deploy","previous_status":"accepted","status":"in_progress","occurred_at":"2026-10-14T20:47:53.901Z"}
+{"schema_version":1,"message_id":"c70d…:outcome","task_id":"c70d…","tenant_id":"0378…",
+ "task_type":"deploy","previous_status":"in_progress","status":"done","occurred_at":"2026-10-14T20:47:55.466Z"}
+```
+
+**Why the IDs are derived, not random.** A redelivered task is simulated
+again, and its updates must carry the same keys, or the control plane
+could not recognise them as duplicates. The outcome has one key whether
+it is `done` or `failed`. If a rerun draws a different outcome, it is a
+duplicate of the first one, and the first outcome recorded wins.
+
+---
+
+## 11. Inbound updates: idempotency and ordering
+
+```
+ tenant.task-updates.control-plane ──> UpdateConsumer (prefetch N, N handlers, manual ack)
+        │                                 │ decode + validate against the schema
+        │                                 │     └── malformed ──────────────────────────> reject ──> tenant.dead-letter
+        │                                 v
+        │                    ApplyUpdate, one PostgreSQL transaction:
+        │                      1. INSERT message_id INTO processed_updates   (conflict => duplicate)
+        │                      2. SELECT task FOR UPDATE; check tenant_id, task_type
+        │                      3. advance task  (already reached or passed => stale / conflict)
+        │                      4. terminal outcome: move tenant, version + 1 (optimistic lock)
+        │                    COMMIT
+        │                                 ├── applied | duplicate | stale | conflict ────> ack
+        │                                 ├── permanent (task not found, mismatch) ─────> reject ──> tenant.dead-letter
+        └──── requeue <── MaxAttempts ────┴── retryable (DB down, timeout) ──> backoff, retry in-process
+```
+
+Delivery is at-least-once; **applying** an update is idempotent. However
+many times an update arrives, and in whatever order, the database ends in
+the state it would reach if each logical update arrived exactly once and
+in order. Three mechanisms make that hold:
+
+1. **A stable key.** `message_id` is derived from the task, so every copy
+   of a logical update carries the same key.
+2. **Key and effect commit together.** The `processed_updates` row is in
+   the same transaction as the state change. If it rolls back, the key
+   goes with it, so the retry is applied rather than skipped. Concurrent
+   copies block on the primary key: one commits, the others see
+   `duplicate`.
+3. **Ack after commit.** A crash between commit and ack causes a
+   redelivery, which is found as `duplicate` and acked
+   (`TestInboundCrashAfterCommitBeforeAck`).
+
+Keys alone do not stop a *different* key describing stale or
+contradicting progress, so the state machine is the second line of
+defence:
+
+| Situation | Outcome | Effect |
+| --- | --- | --- |
+| first delivery of a valid update | `applied` | task advances; on `done`/`failed` the tenant moves and `version` + 1 |
+| same `message_id` again | `duplicate` | none |
+| task already at or past that status (`in_progress` after `done`) | `stale` | none, key recorded |
+| terminal outcome contradicting the recorded one (`failed` after `done`) | `conflict` | none, key recorded, WARN logged; the first outcome wins |
+| outcome arrives before its `in_progress` | `applied` | task steps `accepted → in_progress → done` in one transaction; the late `in_progress` is then `stale` |
+| update for a terminal task after its tenant moved on | `stale` | none; the tenant is not dragged back |
+| unknown task, or `tenant_id`/`task_type` mismatch | dead-lettered | none; key not recorded, so it can be replayed once fixed |
+| malformed (not JSON, bad schema, illegal transition, bad timestamp) | dead-lettered | none |
+
+**Poison messages never kill the consumer.** Malformed and permanently
+failing messages are rejected to `tenant.dead-letter` at once. Transient
+failures (database down) are retried with backoff, up to
+`INBOUND_MAX_ATTEMPTS` in-process attempts. After that the delivery is
+requeued so it cannot hold a slot forever. The quorum queue's delivery
+limit (20) is the final bound: a message failing every time is
+eventually dead-lettered, never looped forever.
+
+**Concurrency.** `INBOUND_CONCURRENCY` handlers (default 4) share one
+channel. Updates for one task are serialised by the task row lock, and
+several api replicas can consume the same queue. On SIGTERM, in-flight
+updates get `INBOUND_SHUTDOWN_TIMEOUT` to commit and ack; the rest are
+requeued.
+
+---
+
+## 12. Worker simulator
+
+`cmd/worker` is a separate process with no HTTP API and no database. It
+consumes `tenant.tasks.worker` with prefetch 1. For each task it:
+
+1. waits a random delay in `[--min-delay-ms, --max-delay-ms]`
+2. publishes `in_progress`
+3. waits again
+4. publishes `done`, or `failed` with probability `--fail-rate`
+5. **acks only after both updates are broker-confirmed**
+
+Reliability:
+
+- **Crash or kill mid-task:** the task is unacked, RabbitMQ redelivers it,
+  and it is re-run with the same update IDs, so the control plane
+  discards the duplicates.
+- **Publish failure:** the task is requeued after a 1s pause.
+- **Malformed task:** rejected to the dead-letter queue, and the worker
+  carries on.
+- **Broker down:** the worker reconnects with capped backoff (500ms to 30s).
+- **SIGTERM:** the in-flight task gets `--shutdown-timeout` (10s) to
+  finish; otherwise it is requeued.
+
+Flags (each has a `WORKER_*` environment variable equivalent; flags win):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--fail-rate` | `0` | probability in [0,1] that a task ends `failed` |
+| `--min-delay-ms` / `--max-delay-ms` | `500` / `2000` | range of each of the two waits; `0`/`0` is instant |
+| `--seed` | `0` (random) | same seed + same task sequence = same delays and outcomes; the seed in use is logged |
+| `--shutdown-timeout` | `10s` | grace for the in-flight task on SIGTERM |
+
+Invalid values (rate outside [0,1], min > max, negative delays) stop the
+worker at startup with every problem listed.
+
+In compose, restart the worker with different flags:
 
 ```bash
-curl -s 'localhost:8080/v1/tenants?status=active&limit=20'
-curl -s 'localhost:8080/v1/tasks?tenant_id=<id>&status=in_progress'
-curl -s 'localhost:8080/v1/tenants?limit=20&cursor=<next_cursor from the previous page>'
+make worker WORKER_ARGS="--fail-rate=1"
+make worker WORKER_ARGS="--fail-rate=0.3 --min-delay-ms=0 --max-delay-ms=200 --seed=42"
+make worker                     # back to the defaults
 ```
 
-```json
-{ "items": [ … ], "next_cursor": "eyJjIjoi…" }
+`make worker` recreates only the worker container (`--no-deps
+--force-recreate`). An unacked in-flight task goes back to the queue and
+is picked up by the new worker.
+
+---
+
+## 13. Walkthroughs
+
+All commands assume `make up` has finished. The scripts exit non-zero if
+any step ends in the wrong state, so they double as smoke tests.
+
+### Successful lifecycle
+
+```bash
+make smoke
 ```
 
-| Parameter   | Endpoints                  | Meaning                                                |
-| ----------- | -------------------------- | ------------------------------------------------------ |
-| `limit`     | both lists                 | Page size, 1-200, default 50                           |
-| `cursor`    | both lists                 | Opaque `next_cursor` of the previous page              |
-| `status`    | `/v1/tenants`, `/v1/tasks` | Exact status match; must be a valid status of that resource |
-| `tenant_id` | `/v1/tasks`                | Tasks of one tenant                                    |
-
-- Lists are ordered by creation time, oldest first. Pagination is keyset
-  (cursor) based rather than offset based, so pages stay stable while new
-  rows are inserted.
-- `next_cursor` is omitted on the last page.
-- Filters combine with AND.
-- Unknown parameters, repeated parameters, an out-of-range `limit`, an
-  unknown `status` or a malformed `cursor` give `400 invalid_request`. A
-  typo is rejected rather than silently returning everything (or nothing).
-- An empty value (`?status=`) is the same as omitting the parameter.
-- `tenant_id` of a tenant that does not exist returns an empty list.
-
-### Errors
-
-Every error, including unknown routes and panics, has the same body:
-
-```json
-{ "error": { "code": "invalid_request", "message": "invalid slug: must be 3-28 characters, got 2", "field": "slug" } }
+```text
+== POST /v1/tenants slug=demo-1792010590-5432
+{"tenant":{"status":"provisioning","version":1},"task":{"type":"deploy","status":"accepted"}}
+{"slug":"demo-1792010590-5432","status":"active","version":2}
+{"type":"deploy","status":"done"}
+== PATCH name, version=2
+{"tenant":"updating","task":"update"}
+{"slug":"demo-1792010590-5432","status":"active","version":4}
+{"type":"deploy","status":"done"}
+{"type":"update","status":"done"}
+== DELETE
+{"tenant":"destroying","task":"destroy"}
+{"slug":"demo-1792010590-5432","status":"destroyed","version":6}
+{"type":"deploy","status":"done"}
+{"type":"update","status":"done"}
+{"type":"destroy","status":"done"}
+== POST the same slug again
+409 tenant_already_exists
+OK: tenant afa74a33-3f94-4d91-8eaf-c6d9f5e9a30b
 ```
 
-- `code` is stable and machine-readable; branch on it.
-- `message` is for humans.
-- `field` is present when one body field or query parameter is at fault.
+The version goes 1 → 2 (deploy done) → 3 (PATCH) → 4 (update done) → 5
+(DELETE) → 6 (destroy done). Worker-applied changes count as mutations.
 
-| Code                        | Status | When |
-| --------------------------- | ------ | ---- |
-| `invalid_request`           | 400    | Malformed JSON, missing/null/mistyped/unsupported field, invalid slug or name, missing `version`, bad query parameter |
-| `tenant_not_found`          | 404    | No tenant with that ID (any malformed ID too) |
-| `task_not_found`            | 404    | No task with that ID |
-| `route_not_found`           | 404    | No such path |
-| `method_not_allowed`        | 405    | Path exists, method does not (`Allow` header lists the valid ones) |
-| `tenant_already_exists`     | 409    | Slug taken, including by a destroyed tenant |
-| `tenant_update_not_allowed` | 409    | PATCH or DELETE not allowed in the tenant's current status |
-| `tenant_version_conflict`   | 409    | `version` is stale, or the tenant changed during the request |
-| `payload_too_large`         | 413    | Body over 1 MiB |
-| `unsupported_media_type`    | 415    | Body not sent as `application/json` |
-| `internal_error`            | 500    | Anything unexpected |
-| `request_timeout`           | 503    | The request did not complete within `HTTP_REQUEST_TIMEOUT` |
+By hand, watching each step (`watch` is not on macOS by default:
+`brew install watch`):
 
-The three 409s share a status because each means "the request conflicts
-with the tenant's current state". The code tells them apart.
+```bash
+SLUG="by-hand-$RANDOM"   # slugs are unique forever, so a fixed one only works once
+ID=$(curl -s -XPOST localhost:8080/v1/tenants -H 'Content-Type: application/json' \
+  -d "{\"slug\":\"$SLUG\",\"name\":\"By hand\"}" | jq -r '.tenant.id // empty')
+if [ -z "$ID" ]; then echo "create failed (slug taken or server down?)"; else
+watch -n 0.5 "curl -s localhost:8080/v1/tenants/$ID | jq -c '{status,version}';
+              curl -s 'localhost:8080/v1/tasks?tenant_id=$ID' | jq -c '.items[]|{type,status}'"
+fi
+# provisioning v1 / deploy accepted  ->  provisioning v1 / deploy in_progress  ->  active v2 / deploy done
+# A fast worker may already be at active v2 / deploy done on the first refresh.
+```
 
-- **Where the mapping lives.** The whole mapping is one function,
-  `classify` in
-  [`internal/adapters/httpapi/errors.go`](internal/adapters/httpapi/errors.go).
-  Handlers only return errors.
-- **What the client sees.** For contract errors the message is the error's
-  fixed text. Validation errors show only the rule that was broken.
-  Anything else becomes an opaque `internal_error`. Its details (database
-  errors, stack traces of recovered panics) go to the log, tagged with the
-  request ID, and never reach the client.
+### Failure scenario: `--fail-rate=1`
 
-### Operational behaviour
+```bash
+make worker WORKER_ARGS="--fail-rate=1"
+scripts/lifecycle.sh failed
+```
 
-- **Request IDs and logging.** Every request gets an `X-Request-ID`. A
-  client-supplied ID is used if it is 1-64 characters of `[A-Za-z0-9._-]`;
-  otherwise a UUID is generated. The ID is echoed in the response, and one
-  JSON log line is written per request with `request_id`, `method`,
-  `path`, `status`, `bytes` and `duration_ms`.
-- **Timeouts.** `HTTP_REQUEST_TIMEOUT` (default 10s) is a deadline on the
-  request context. When it expires, database calls are cancelled and the
-  client gets `503 request_timeout`. The server also sets
-  `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout` (which must exceed the
-  request timeout) and `IdleTimeout`.
-- **Graceful shutdown.** On SIGINT/SIGTERM the server stops accepting
-  connections, waits up to `HTTP_SHUTDOWN_TIMEOUT` (default 15s) for
-  in-flight requests to finish, then stops the background components and
-  exits.
+```text
+== POST /v1/tenants slug=demo-1792010619-5683
+{"tenant":{"status":"provisioning","version":1},"task":{"type":"deploy","status":"accepted"}}
+{"slug":"demo-1792010619-5683","status":"failed","version":2}
+{"type":"deploy","status":"failed"}
+== DELETE the failed tenant (worker still fails, so it ends failed again)
+{"tenant":"destroying","task":"destroy"}
+{"slug":"demo-1792010619-5683","status":"failed","version":4}
+{"type":"deploy","status":"failed"}
+{"type":"destroy","status":"failed"}
+OK: tenant 2b7cc203-d140-45d9-8631-ce7c97adfd6a
+```
 
-## Configuration
+The worker log shows the reason:
 
-All configuration comes from environment variables (see `.env.example`).
-No credentials are committed; `.env` is git-ignored.
+```bash
+docker compose logs worker | grep '"task finished"' | tail -2
+# ..."task_type":"deploy","status":"failed","reason":"simulated deploy failure (fail rate 1)"
+```
 
-| Variable                  | Default | Used by |
-| ------------------------- | ------- | ------- |
-| `DATABASE_URL`            | required | api |
-| `RABBITMQ_URL`            | required | api, worker |
-| `HTTP_ADDR`               | `:8080` | api |
-| `HTTP_REQUEST_TIMEOUT`    | `10s`   | api (must be below `HTTP_WRITE_TIMEOUT`) |
-| `HTTP_READ_HEADER_TIMEOUT` / `HTTP_READ_TIMEOUT` / `HTTP_WRITE_TIMEOUT` / `HTTP_IDLE_TIMEOUT` | `5s` / `15s` / `15s` / `60s` | api |
-| `HTTP_SHUTDOWN_TIMEOUT`   | `15s`   | api |
-| `OUTBOX_POLL_INTERVAL`    | `500ms` | api: wait between polls when nothing is due |
-| `OUTBOX_BATCH_SIZE`       | `100`   | api: events claimed per poll |
-| `OUTBOX_LEASE`            | `30s`   | api: claim duration; must exceed 2 x `OUTBOX_PUBLISH_TIMEOUT` |
-| `OUTBOX_PUBLISH_TIMEOUT`  | `5s`    | api: bound on one publish incl. confirm, and on the mark |
-| `OUTBOX_RETRY_MIN` / `OUTBOX_RETRY_MAX` | `500ms` / `30s` | api: retry backoff bounds |
-| `INBOUND_CONCURRENCY`     | `4`     | api: updates applied in parallel (and prefetch), 1-64 |
-| `INBOUND_MAX_ATTEMPTS`    | `10`    | api: in-process attempts per delivery before it is requeued |
-| `INBOUND_RETRY_MIN` / `INBOUND_RETRY_MAX` | `200ms` / `10s` | api: retry and reconnect backoff bounds |
-| `INBOUND_APPLY_TIMEOUT`   | `10s`   | api: bound on one attempt to apply an update |
-| `INBOUND_SHUTDOWN_TIMEOUT` | `10s`  | api: time in-flight updates may finish after SIGTERM |
-| `LOG_LEVEL`               | `info`  | api, worker |
-| `WORKER_FAIL_RATE` / `--fail-rate`         | `0`    | worker: probability in [0,1] that a task fails |
-| `WORKER_MIN_DELAY_MS` / `--min-delay-ms`   | `500`  | worker: lower bound of each of the two waits |
-| `WORKER_MAX_DELAY_MS` / `--max-delay-ms`   | `2000` | worker: upper bound (at most 3600000) |
-| `WORKER_SEED` / `--seed`                   | `0` (random) | worker: seed for delays and outcomes |
-| `WORKER_SHUTDOWN_TIMEOUT` / `--shutdown-timeout` | `10s` | worker: time the in-flight task may finish after SIGTERM |
+Back to success: `make worker`, then DELETE the failed tenant again. It
+now reaches `destroyed`. An update failure (`active → updating → failed`)
+works the same way: create with the default worker, then
+`make worker WORKER_ARGS="--fail-rate=1"` and PATCH.
+
+### Duplicate and out-of-order messages
+
+```bash
+make replay
+```
+
+```text
+tenant c9be8b1a-… is {"status":"active","version":2}, deploy task 89a06b49-…
+duplicate:   the worker's own outcome again (same message_id)
+out of order: in_progress after done, new message_id
+conflict:    failed after done
+unknown task (dead-lettered)
+malformed body (dead-lettered)
+tenant now {"status":"active","version":2}, task done, dead letters 0 -> 2
+OK: duplicates and stale updates changed nothing; poison messages were dead-lettered and the consumer kept going
+```
+
+The api log shows how each one was classified (`make logs`):
+
+```text
+"msg":"duplicate task update ignored","message_id":"89a06b49-…:outcome"
+"msg":"stale task update ignored","message_id":"manual-stale-13071","status":"in_progress"
+"level":"WARN","msg":"conflicting task outcome ignored; the first outcome recorded stands"
+"level":"ERROR","msg":"dead-lettering task update that can never be applied","message_id":"manual-ghost-18277"
+"level":"ERROR","msg":"dead-lettering malformed task update","message_id":"garbage-1"
+```
+
+[`scripts/replay.sh`](scripts/replay.sh) publishes through RabbitMQ's own
+management HTTP API (`POST /api/exchanges/%2F/tenant.task-updates/publish`).
+Its `publish` function is the snippet to reuse for other scenarios:
+
+```bash
+set -a; . ./.env; set +a          # RABBITMQ_USER / RABBITMQ_PASSWORD
+TASK=<task id>; TENANT=<tenant id>
+jq -nc --arg id "manual-1" --arg task "$TASK" --arg tenant "$TENANT" '
+  {schema_version:1, message_id:$id, task_id:$task, tenant_id:$tenant, task_type:"deploy",
+   previous_status:"accepted", status:"in_progress", occurred_at:"2026-01-01T00:00:00.000Z"}
+  | {properties:{message_id:$id, content_type:"application/json", delivery_mode:2},
+     routing_key:"task_update.in_progress", payload:tojson, payload_encoding:"string"}' |
+curl -s -u "$RABBITMQ_USER:$RABBITMQ_PASSWORD" -H 'Content-Type: application/json' \
+  -XPOST localhost:15672/api/exchanges/%2F/tenant.task-updates/publish -d @-
+# {"routed":true}
+```
+
+Inspect dead letters without consuming them:
+
+```bash
+curl -s -u "$RABBITMQ_USER:$RABBITMQ_PASSWORD" -H 'Content-Type: application/json' \
+  -XPOST localhost:15672/api/queues/%2F/tenant.dead-letter/get \
+  -d '{"count":10,"ackmode":"ack_requeue_true","encoding":"auto"}' |
+  jq '.[] | {id: .properties.message_id, reason: .properties.headers["x-first-death-reason"]}'
+```
+
+**Out-of-order delivery of the worker's own updates:** with
+`make worker WORKER_ARGS="--min-delay-ms=0 --max-delay-ms=0"`, the api's
+`INBOUND_CONCURRENCY=4` handlers can pick up a task's `done` before its
+`in_progress`. The result is still `accepted → in_progress → done`
+and v2. `TestApplyUpdateOutOfOrder` and `TestInboundStaleDelivery` cover
+this deterministically.
+
+### Broker and database outages
+
+```bash
+# Broker down: the API keeps accepting work; events wait in the outbox and are published on recovery.
+docker compose stop rabbitmq
+curl -s -XPOST localhost:8080/v1/tenants -H 'Content-Type: application/json' -d '{"slug":"outage-demo","name":"x"}'
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "select task_id, attempts, last_error from outbox_events where published_at is null"'
+docker compose start rabbitmq     # ~15s later (broker boot + retry backoff) the tenant is active
+
+# Database down while updates arrive: the consumer retries with backoff; nothing is dead-lettered.
+docker compose stop postgres; sleep 10; docker compose start postgres
+```
+
+### Concurrency against the live stack
+
+```bash
+make race-check RACECHECK_ARGS="-n 64 -rounds 3"
+```
+
+```text
+round 1 (rc-mv8kvdeu-0): ok
+round 2 (rc-mv8kvl4l-1): ok
+round 3 (rc-mv8kvqvs-2): ok
+all 3 rounds passed with 64 concurrent requests per step
+```
+
+Each round sends 64 simultaneous creates with one slug, then 64 PATCHes
+with one version, then 64 DELETEs. It checks that exactly one of each
+wins, that the losers get the documented codes, that versions go
+2 → 4 → 6, that exactly three tasks exist, and that the destroyed slug
+stays taken. It needs the worker at `--fail-rate=0` and exits 1 on any
+violation.
+
+---
+
+## 14. Tests and quality gates
+
+```bash
+make check     # = fmt-check vet lint vuln test, stops at the first failure
+```
+
+| Gate | Command | What it checks |
+| --- | --- | --- |
+| Formatting | `make fmt-check` (`gofmt -l .`) | every Go file is gofmt-formatted (`make fmt` fixes it, incl. goimports) |
+| Vet | `make vet` (`go vet ./...`) | standard static checks |
+| Lint | `make lint` (golangci-lint v2.14.0) | errcheck, govet, staticcheck, unused, ineffassign, revive, errorlint, bodyclose, noctx, misspell, unconvert, **gosec** (see `.golangci.yml`) |
+| Vulnerabilities | `make vuln` (govulncheck v1.1.4) | known CVEs reachable from our code, in dependencies and the standard library |
+| Tests | `make test` (`go test -race -count=1 ./...`) | the whole suite under the race detector |
+
+Linters and govulncheck run with `go run …@version`, so they need no
+install. The first run downloads them.
+
+Extra commands:
+
+```bash
+make cover                     # suite + coverage summary
+make stress                    # every *Concurrent* test 20x under -race (STRESS_COUNT=n)
+go test -short ./...           # unit tests only (skips anything needing Docker), a few seconds
+```
+
+### Test layers
+
+| Layer | Where | Uses |
+| --- | --- | --- |
+| Unit | `internal/domain`, `internal/application` (fakes), `internal/config`, `internal/worker`, `httpapi` router | no I/O; fake clock and scripted randomness, so nothing sleeps |
+| Integration | `internal/adapters/postgres`, `internal/adapters/rabbitmq` | real PostgreSQL 17 / RabbitMQ 4.1 via testcontainers; one database / vhost per test |
+| End-to-end | `tests/` | real router + services + PostgreSQL + RabbitMQ + outbox relay + consumer + worker, in-process |
+| Live system | `make smoke`, `make replay`, `make race-check` | the compose stack, over HTTP and the broker |
+
+Set `TEST_DATABASE_URL` / `TEST_RABBITMQ_URL` to use existing servers
+instead of testcontainers. Integration tests skip only under `-short` or
+when Docker is unreachable.
+
+### Requirement → test map
+
+| Requirement | Tests |
+| --- | --- |
+| create → deploy `accepted` → `in_progress` → `done` → tenant `active` | `TestInboundDeployStepByStep`, `TestInboundLifecycle`, `TestInboundFullLoop` |
+| deploy / update / destroy failure → tenant `failed`; DELETE from `failed` | `TestFailureOutcomes` |
+| PATCH / DELETE rejected from every disallowed status | `TestInvalidStateTransitions`, domain table tests |
+| duplicate slug → `tenant_already_exists`, also after destruction | `TestDuplicateSlug`, `TestTenantSlugUnique`, `TestCreateTenantDuplicateSlug` |
+| concurrent same-slug creates: exactly one success, losers leave nothing behind | `TestConcurrentCreatesWithSameSlug`, `TestAppConcurrentCreatesSameSlug` |
+| concurrent same-version PATCHes: exactly one success | `TestConcurrentPatchesWithSameVersion`, `TestAppConcurrentUpdatesSameVersion` |
+| version increments on every mutation, incl. worker-applied | `TestTenantVersionLifecycle`, `TestWorkerUpdateIncrementsTenantVersion`, `TestInboundDeployStepByStep`, `TestTenantGuardTrigger` |
+| event published only after commit; rollback leaves no task / outbox row | `TestOutboxClaimSeesOnlyCommittedEvents`, `TestAppMutationsRollBack`, `TestWithinTxRollsBack`, `TestOutboxPublishesEveryMutation` |
+| broker outage does not lose committed tasks | `TestOutboxBrokerUnavailableAtStartup`, `TestOutboxTransientBrokerFailures` |
+| publisher crash: redelivery, but correct domain state | `TestOutboxCrashWindowRedelivers`, `TestRecoveryPublisherCrashRedelivery` |
+| restart: tenants and pending outbox rows survive | `TestRecoveryRestart` |
+| duplicate updates have no effect | `TestInboundDuplicateDelivery`, `TestApplyUpdateDuplicateChangesNothing`, `TestAppConcurrentDuplicateUpdates` |
+| stale / out-of-order updates cannot regress state | `TestInboundStaleDelivery`, `TestInboundTerminalProtection`, `TestApplyUpdateOutOfOrder` |
+| poison messages do not kill the consumer | `TestInboundTaskNotFound`, `TestConsumerDeadLettersMalformedUpdates`, `TestConsumerFailingForeverIsBounded`, `TestWorkerDeadLettersMalformedMessages` |
+| transient DB failure retried with backoff | `TestInboundTransientDatabaseFailure`, `TestConsumerRetriesTransientFailures` |
+| crash after commit, before ack | `TestInboundCrashAfterCommitBeforeAck` |
+| worker fail rate, delays, stable IDs, graceful shutdown | `internal/worker`, `TestWorker*` |
+
+To check that the tests catch real bugs, safeguards were removed one at a
+time: ack before apply, ignoring the idempotency key, no version check,
+the wrong destroy-failure outcome, PATCH allowed on `destroyed`, and
+others. A test failed for each one.
+
+---
+
+## 15. Configuration reference
+
+All configuration comes from environment variables. Copy `.env.example`
+to `.env` (`make up` does it for you); `.env` is git-ignored.
+
+**Compose / Makefile**
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | required | database credentials; the api's `DATABASE_URL` is built from them |
+| `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | required | broker credentials; both `RABBITMQ_URL`s are built from them |
+| `API_PORT` | `8080` | host port of the api |
+| `POSTGRES_PORT` / `RABBITMQ_PORT` / `RABBITMQ_MANAGEMENT_PORT` | `5432` / `5672` / `15672` | host ports (bound to 127.0.0.1 only) |
+| `WORKER_ARGS` | empty | flags for the worker container, e.g. `make worker WORKER_ARGS="--fail-rate=1"` |
+| `STRESS_COUNT` | `20` | repetitions for `make stress` |
+| `RACECHECK_ARGS` | empty | `-url`, `-n`, `-rounds`, `-timeout` for `make race-check` |
+
+**api (`cmd/api`)**
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DATABASE_URL` | required | PostgreSQL URL (set by compose; used directly by `make run-api`) |
+| `RABBITMQ_URL` | required | AMQP URL |
+| `HTTP_ADDR` | `:8080` | listen address |
+| `HTTP_REQUEST_TIMEOUT` | `10s` | per-request deadline; must be below `HTTP_WRITE_TIMEOUT` |
+| `HTTP_READ_HEADER_TIMEOUT` / `HTTP_READ_TIMEOUT` / `HTTP_WRITE_TIMEOUT` / `HTTP_IDLE_TIMEOUT` | `5s` / `15s` / `15s` / `60s` | server timeouts |
+| `HTTP_SHUTDOWN_TIMEOUT` | `15s` | grace for in-flight requests on SIGTERM |
+| `OUTBOX_POLL_INTERVAL` | `500ms` | relay wait when nothing is due |
+| `OUTBOX_BATCH_SIZE` | `100` | events claimed per poll |
+| `OUTBOX_LEASE` | `30s` | claim duration; must exceed 2 × `OUTBOX_PUBLISH_TIMEOUT` |
+| `OUTBOX_PUBLISH_TIMEOUT` | `5s` | bound on one publish + confirm |
+| `OUTBOX_RETRY_MIN` / `OUTBOX_RETRY_MAX` | `500ms` / `30s` | publish retry backoff |
+| `INBOUND_CONCURRENCY` | `4` | updates applied in parallel (and prefetch), 1-64 |
+| `INBOUND_MAX_ATTEMPTS` | `10` | in-process attempts before a delivery is requeued |
+| `INBOUND_RETRY_MIN` / `INBOUND_RETRY_MAX` | `200ms` / `10s` | apply retry and reconnect backoff |
+| `INBOUND_APPLY_TIMEOUT` | `10s` | bound on one apply attempt |
+| `INBOUND_SHUTDOWN_TIMEOUT` | `10s` | grace for in-flight updates on SIGTERM |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` (api and worker) |
+
+**worker (`cmd/worker`)**: `RABBITMQ_URL`, `LOG_LEVEL`, and
+`WORKER_FAIL_RATE`, `WORKER_MIN_DELAY_MS`, `WORKER_MAX_DELAY_MS`,
+`WORKER_SEED`, `WORKER_SHUTDOWN_TIMEOUT`. The flags in
+[§12](#12-worker-simulator) override these.
+
+Invalid configuration stops the process at startup with every problem
+listed, not just the first.
+
+---
+
+## 16. Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `make up`: `set POSTGRES_USER in .env` | `.env` is missing or incomplete. Run `make .env`, or `cp .env.example .env`. |
+| `make up`: `port is already allocated` / `address already in use` | Something else holds 8080, 5432, 5672 or 15672. Set `API_PORT`, `POSTGRES_PORT`, `RABBITMQ_PORT` or `RABBITMQ_MANAGEMENT_PORT` in `.env`. If you then use `make run-api`, update `DATABASE_URL`/`RABBITMQ_URL` there too. |
+| `make up` exits with `dependency failed to start` / unhealthy | `docker compose logs <service>`. A failing api usually means a bad migration or config error, and its last log line says which. |
+| Tenant stuck in `provisioning` | Is the worker running (`make ps`, `docker compose logs worker`)? Is the event still in the outbox? Run `select task_id, attempts, last_error from outbox_events where published_at is null` (see [§13](#broker-and-database-outages)). With `--max-delay-ms` large, it is just slow. |
+| api or worker logs `PRECONDITION_FAILED ... inequivalent arg` | The broker volume has queues from an older version of this repo with different arguments. `make clean && make up` (deletes local data). |
+| `make run-api`: `address already in use` | The containerised api already holds 8080. Use `make deps` instead of `make up` when running the binaries on the host, or `docker compose stop api worker`. |
+| Credentials with `@`, `:` or `/` break connections | They are interpolated into URLs unescaped. Use URL-safe passwords, or percent-encode them. |
+| Integration tests are skipped, or fail with `Cannot connect to the Docker daemon` | testcontainers needs Docker. With Colima or Podman, set `DOCKER_HOST`, and `TESTCONTAINERS_RYUK_DISABLED=true` if Ryuk cannot start. |
+| First `make check` is slow | It downloads the Go 1.26.9 toolchain, golangci-lint, govulncheck and the test container images. Later runs take about 1-2 minutes. |
+| `make replay`: `tenant ... did not become active` | The worker is at `--fail-rate>0`. Run `make worker` first. |
+| `make race-check` reports failures | It needs the worker at `--fail-rate=0`, because it expects every task to finish `done`. |
+| Wrong `go` version errors | `GOTOOLCHAIN=local` stops the toolchain download. Unset it, or install Go 1.26.9. |
+
+---
+
+## 17. Known limitations
+
+- **At-least-once, not exactly-once.** Tasks can be published and
+  processed more than once (crash between confirm and mark, lost confirm,
+  worker crash mid-task). The state is "effectively once"; the messages
+  are not.
+- **The first terminal outcome wins.** A contradicting late outcome is
+  logged as a warning and ignored. A real system would alert on it.
+- **`processed_updates` grows without bound.** A periodic
+  `DELETE … WHERE processed_at < now() - interval '30 days'` would be safe,
+  but is not implemented. The same goes for published `outbox_events`
+  rows.
+- **Dead-lettering is at-most-once in RabbitMQ by default.** The
+  at-least-once dead-letter strategy needs `x-overflow: reject-publish`
+  on the source queues, and changing it later forces the queues to be
+  recreated.
+- **Bounded head-of-line blocking.** A retrying update holds one of
+  `INBOUND_CONCURRENCY` slots for up to `INBOUND_MAX_ATTEMPTS` attempts.
+  A database outage longer than about 14 minutes (the delivery limit)
+  parks updates in the dead-letter queue. They are kept, not lost, but
+  must be replayed by hand.
+- **No automatic retry of failed tenants.** `failed` is recoverable only
+  by DELETE. There is no "retry deploy" endpoint.
+- **DELETE can return `tenant_version_conflict`** when it races another
+  mutation, even though DELETE sends no version (see [§9](#9-optimistic-locking)).
+- **No authentication, authorisation, TLS or rate limiting.** It is a
+  local exercise; every port is bound to 127.0.0.1.
+- **`/healthz` is liveness only.** It does not check PostgreSQL or
+  RabbitMQ. Compose ordering relies on the dependencies' own health
+  checks, and the relay and consumer reconnect on their own.
+- **No metrics or tracing.** Observability is structured JSON logs only.
+- **Restart tests in Go restart processes, not containers.**
+  `TestRecoveryRestart` starts a new control plane on the same database.
+  Container restarts (`make down && make up`) were checked by hand: tenant
+  count identical before and after.
+- **Credentials are interpolated into connection URLs unescaped**, so
+  passwords must be URL-safe.
+- **Single-node broker and database.** Quorum queues are used so the
+  topology is production-shaped, but locally there is one replica of
+  each.

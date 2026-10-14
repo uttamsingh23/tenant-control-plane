@@ -1,9 +1,17 @@
-# Local configuration (may contain credentials)
+# Local configuration (may contain credentials); only the example is committed
 .env
+.env.*
+!.env.example
 
-# Build output
+# Keys and certificates
+*.pem
+*.key
+*.p12
+
+# Build output and local artefacts
 /bin/
 /coverage.out
+*.log
 
 # Editors / OS
 .idea/
