@@ -1,7 +1,9 @@
 package application
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -13,6 +15,19 @@ var tenantStatusFor = map[domain.TaskType]domain.TenantStatus{
 	domain.TaskTypeDeploy:  domain.TenantStatusProvisioning,
 	domain.TaskTypeUpdate:  domain.TenantStatusUpdating,
 	domain.TaskTypeDestroy: domain.TenantStatusDestroying,
+}
+
+// updateFor is the update a worker sends to report status for task: it
+// echoes the task's tenant and type, and names the transition.
+func updateFor(task domain.Task, id string, status domain.TaskStatus) domain.TaskUpdate {
+	previous := domain.TaskStatusInProgress
+	if status == domain.TaskStatusInProgress {
+		previous = domain.TaskStatusAccepted
+	}
+	return domain.TaskUpdate{
+		ID: id, TaskID: task.ID, TenantID: task.TenantID, TaskType: task.Type,
+		PreviousStatus: previous, Status: status, OccurredAt: t0,
+	}
 }
 
 func TestApplyUpdate(t *testing.T) {
@@ -45,10 +60,13 @@ func TestApplyUpdate(t *testing.T) {
 		{typ: domain.TaskTypeDeploy, from: inProgress, report: inProgress, want: UpdateStale, wantTask: inProgress},
 		{typ: domain.TaskTypeDeploy, from: done, report: inProgress, want: UpdateStale, wantTask: done},
 		{typ: domain.TaskTypeDeploy, from: done, report: done, want: UpdateStale, wantTask: done},
-		{typ: domain.TaskTypeDeploy, from: done, report: failed, want: UpdateStale, wantTask: done},
 		{typ: domain.TaskTypeDestroy, from: failed, report: inProgress, want: UpdateStale, wantTask: failed},
-		{typ: domain.TaskTypeDestroy, from: failed, report: done, want: UpdateStale, wantTask: failed},
 		{typ: domain.TaskTypeDestroy, from: failed, report: failed, want: UpdateStale, wantTask: failed},
+
+		// Conflict: a late outcome contradicting the recorded one. The
+		// first outcome wins.
+		{typ: domain.TaskTypeDeploy, from: done, report: failed, want: UpdateConflict, wantTask: done},
+		{typ: domain.TaskTypeDestroy, from: failed, report: done, want: UpdateConflict, wantTask: failed},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.typ)+"/"+string(tt.from)+"->"+string(tt.report), func(t *testing.T) {
@@ -61,7 +79,7 @@ func TestApplyUpdate(t *testing.T) {
 			task := seedTask(store, tenant, tt.typ, tt.from)
 			before := snapshot(store)
 
-			got, err := tasks.ApplyUpdate(t.Context(), domain.TaskUpdate{ID: "u1", TaskID: task.ID, Status: tt.report})
+			got, err := tasks.ApplyUpdate(t.Context(), updateFor(task, "u1", tt.report))
 			if err != nil {
 				t.Fatalf("ApplyUpdate: %v", err)
 			}
@@ -76,8 +94,8 @@ func TestApplyUpdate(t *testing.T) {
 			if gotTask.Status != tt.wantTask {
 				t.Errorf("task status = %s, want %s", gotTask.Status, tt.wantTask)
 			}
-			if tt.want == UpdateStale && gotTask != before.tasks[task.ID] {
-				t.Errorf("stale update changed the task: %+v", gotTask)
+			if tt.want != UpdateApplied && gotTask != before.tasks[task.ID] {
+				t.Errorf("%s update changed the task: %+v", tt.want, gotTask)
 			}
 
 			gotTenant := store.tenants[tenant.ID]
@@ -101,7 +119,7 @@ func TestApplyUpdateDuplicateChangesNothing(t *testing.T) {
 	store, _, tasks := newServices()
 	tenant := seedTenant(store, domain.TenantStatusProvisioning)
 	task := seedTask(store, tenant, domain.TaskTypeDeploy, domain.TaskStatusInProgress)
-	update := domain.TaskUpdate{ID: "u1", TaskID: task.ID, Status: domain.TaskStatusDone}
+	update := updateFor(task, "u1", domain.TaskStatusDone)
 
 	if got, err := tasks.ApplyUpdate(t.Context(), update); err != nil || got != UpdateApplied {
 		t.Fatalf("first delivery = %s, %v; want applied", got, err)
@@ -120,11 +138,11 @@ func TestApplyUpdateOutOfOrder(t *testing.T) {
 	tenant := seedTenant(store, domain.TenantStatusProvisioning)
 	task := seedTask(store, tenant, domain.TaskTypeDeploy, domain.TaskStatusAccepted)
 
-	if got, err := tasks.ApplyUpdate(t.Context(), domain.TaskUpdate{ID: "u2", TaskID: task.ID, Status: domain.TaskStatusDone}); err != nil || got != UpdateApplied {
+	if got, err := tasks.ApplyUpdate(t.Context(), updateFor(task, "u2", domain.TaskStatusDone)); err != nil || got != UpdateApplied {
 		t.Fatalf("done = %s, %v; want applied", got, err)
 	}
 	afterDone := snapshot(store)
-	if got, err := tasks.ApplyUpdate(t.Context(), domain.TaskUpdate{ID: "u1", TaskID: task.ID, Status: domain.TaskStatusInProgress}); err != nil || got != UpdateStale {
+	if got, err := tasks.ApplyUpdate(t.Context(), updateFor(task, "u1", domain.TaskStatusInProgress)); err != nil || got != UpdateStale {
 		t.Fatalf("late in_progress = %s, %v; want stale", got, err)
 	}
 	if store.tasks[task.ID] != afterDone.tasks[task.ID] || store.tenants[tenant.ID] != afterDone.tenants[tenant.ID] {
@@ -138,23 +156,38 @@ func TestApplyUpdateOutOfOrder(t *testing.T) {
 // Updates that cannot be applied fail without recording the idempotency
 // key or touching the task or tenant.
 func TestApplyUpdateRejectsWithoutPartialMutation(t *testing.T) {
+	done := func(task domain.Task) domain.TaskUpdate { return updateFor(task, "u1", domain.TaskStatusDone) }
+	with := func(edit func(*domain.TaskUpdate)) func(domain.Task) domain.TaskUpdate {
+		return func(task domain.Task) domain.TaskUpdate {
+			u := done(task)
+			edit(&u)
+			return u
+		}
+	}
 	tests := []struct {
 		name    string
-		update  domain.TaskUpdate
+		update  func(domain.Task) domain.TaskUpdate
 		setup   func(*fakeStore)
 		wantErr error
 	}{
-		{name: "missing update id", update: domain.TaskUpdate{TaskID: "task-deploy", Status: domain.TaskStatusDone}, wantErr: domain.ErrInvalidInput},
-		{name: "update id too long", update: domain.TaskUpdate{ID: strings.Repeat("x", MaxUpdateIDLength+1), TaskID: "task-deploy", Status: domain.TaskStatusDone}, wantErr: domain.ErrInvalidInput},
-		{name: "missing task id", update: domain.TaskUpdate{ID: "u1", Status: domain.TaskStatusDone}, wantErr: domain.ErrInvalidInput},
-		{name: "status accepted", update: domain.TaskUpdate{ID: "u1", TaskID: "task-deploy", Status: domain.TaskStatusAccepted}, wantErr: domain.ErrInvalidInput},
-		{name: "unknown status", update: domain.TaskUpdate{ID: "u1", TaskID: "task-deploy", Status: "exploded"}, wantErr: domain.ErrInvalidInput},
-		{name: "unknown task", update: domain.TaskUpdate{ID: "u1", TaskID: "missing", Status: domain.TaskStatusDone}, wantErr: domain.ErrTaskNotFound},
+		{name: "missing update id", update: with(func(u *domain.TaskUpdate) { u.ID = "" }), wantErr: domain.ErrInvalidInput},
+		{name: "update id too long", update: with(func(u *domain.TaskUpdate) { u.ID = strings.Repeat("x", MaxUpdateIDLength+1) }), wantErr: domain.ErrInvalidInput},
+		{name: "missing task id", update: with(func(u *domain.TaskUpdate) { u.TaskID = "" }), wantErr: domain.ErrInvalidInput},
+		{name: "missing tenant id", update: with(func(u *domain.TaskUpdate) { u.TenantID = "" }), wantErr: domain.ErrInvalidInput},
+		{name: "unknown task type", update: with(func(u *domain.TaskUpdate) { u.TaskType = "resize" }), wantErr: domain.ErrInvalidInput},
+		{name: "status accepted", update: with(func(u *domain.TaskUpdate) { u.Status = domain.TaskStatusAccepted }), wantErr: domain.ErrInvalidInput},
+		{name: "unknown status", update: with(func(u *domain.TaskUpdate) { u.Status = "exploded" }), wantErr: domain.ErrInvalidInput},
+		{name: "skipped transition", update: with(func(u *domain.TaskUpdate) { u.PreviousStatus = domain.TaskStatusAccepted }), wantErr: domain.ErrInvalidInput},
+		{name: "transition out of terminal", update: with(func(u *domain.TaskUpdate) { u.PreviousStatus = domain.TaskStatusFailed }), wantErr: domain.ErrInvalidInput},
+		{name: "missing previous status", update: with(func(u *domain.TaskUpdate) { u.PreviousStatus = "" }), wantErr: domain.ErrInvalidInput},
+		{name: "unknown task", update: with(func(u *domain.TaskUpdate) { u.TaskID = "missing" }), wantErr: domain.ErrTaskNotFound},
+		{name: "other tenant", update: with(func(u *domain.TaskUpdate) { u.TenantID = "tenant-active" }), wantErr: domain.ErrInvalidInput},
+		{name: "other task type", update: with(func(u *domain.TaskUpdate) { u.TaskType = domain.TaskTypeDestroy }), wantErr: domain.ErrInvalidInput},
 		{
 			// The tenant is not waiting for a deploy outcome: the task
 			// change must be rolled back with the rejected tenant change.
 			name:   "tenant not expecting outcome",
-			update: domain.TaskUpdate{ID: "u1", TaskID: "task-deploy", Status: domain.TaskStatusDone},
+			update: done,
 			setup: func(s *fakeStore) {
 				tn := s.tenants["tenant-provisioning"]
 				tn.Status = domain.TenantStatusActive
@@ -162,21 +195,21 @@ func TestApplyUpdateRejectsWithoutPartialMutation(t *testing.T) {
 			},
 			wantErr: domain.ErrInvalidTransition,
 		},
-		{name: "tenant write fails", update: domain.TaskUpdate{ID: "u1", TaskID: "task-deploy", Status: domain.TaskStatusDone}, setup: func(s *fakeStore) { s.failOn = "tenants.update" }, wantErr: errInjected},
-		{name: "task write fails", update: domain.TaskUpdate{ID: "u1", TaskID: "task-deploy", Status: domain.TaskStatusDone}, setup: func(s *fakeStore) { s.failOn = "tasks.update" }, wantErr: errInjected},
-		{name: "idempotency write fails", update: domain.TaskUpdate{ID: "u1", TaskID: "task-deploy", Status: domain.TaskStatusDone}, setup: func(s *fakeStore) { s.failOn = "processed.mark" }, wantErr: errInjected},
+		{name: "tenant write fails", update: done, setup: func(s *fakeStore) { s.failOn = "tenants.update" }, wantErr: errInjected},
+		{name: "task write fails", update: done, setup: func(s *fakeStore) { s.failOn = "tasks.update" }, wantErr: errInjected},
+		{name: "idempotency write fails", update: done, setup: func(s *fakeStore) { s.failOn = "processed.mark" }, wantErr: errInjected},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store, _, tasks := newServices()
 			tenant := seedTenant(store, domain.TenantStatusProvisioning)
-			seedTask(store, tenant, domain.TaskTypeDeploy, domain.TaskStatusInProgress)
+			task := seedTask(store, tenant, domain.TaskTypeDeploy, domain.TaskStatusInProgress)
 			if tt.setup != nil {
 				tt.setup(store)
 			}
 			before := snapshot(store)
 
-			got, err := tasks.ApplyUpdate(t.Context(), tt.update)
+			got, err := tasks.ApplyUpdate(t.Context(), tt.update(task))
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tt.wantErr)
 			}
@@ -188,13 +221,39 @@ func TestApplyUpdateRejectsWithoutPartialMutation(t *testing.T) {
 	}
 }
 
+// IsPermanentUpdateError splits ApplyUpdate's errors into those a retry
+// cannot fix (dead-letter) and those it might (retry), with unknown
+// errors on the retry side.
+func TestIsPermanentUpdateError(t *testing.T) {
+	wrap := func(err error) error { return fmt.Errorf("apply update u1 to task t1: %w", err) }
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{wrap(&domain.ValidationError{Field: "tenant_id", Reason: "mismatch"}), true},
+		{wrap(domain.ErrTaskNotFound), true},
+		{wrap(domain.ErrTenantNotFound), true},
+		{wrap(&domain.TransitionError{Entity: "tenant", From: "active", Trigger: "deploy_done"}), true},
+		{wrap(domain.ErrTenantVersionConflict), false},
+		{wrap(context.DeadlineExceeded), false},
+		{wrap(context.Canceled), false},
+		{wrap(errInjected), false},
+		{errors.New("connection reset by peer"), false},
+	}
+	for _, tt := range tests {
+		if got := IsPermanentUpdateError(tt.err); got != tt.want {
+			t.Errorf("IsPermanentUpdateError(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
 // A rejected update leaves the key unrecorded, so a retry after the cause
 // is fixed is applied rather than treated as a duplicate.
 func TestApplyUpdateRetryAfterFailure(t *testing.T) {
 	store, _, tasks := newServices()
 	tenant := seedTenant(store, domain.TenantStatusProvisioning)
 	task := seedTask(store, tenant, domain.TaskTypeDeploy, domain.TaskStatusInProgress)
-	update := domain.TaskUpdate{ID: "u1", TaskID: task.ID, Status: domain.TaskStatusDone}
+	update := updateFor(task, "u1", domain.TaskStatusDone)
 
 	store.failOn = "tenants.update"
 	if _, err := tasks.ApplyUpdate(t.Context(), update); err == nil {

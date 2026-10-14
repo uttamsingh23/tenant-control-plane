@@ -73,11 +73,28 @@ func (s services) counts(t *testing.T) [3]int {
 	return c
 }
 
+// workerUpdate is the update a worker sends to report status for task,
+// with a fresh idempotency key.
+func workerUpdate(task domain.Task, status domain.TaskStatus) domain.TaskUpdate {
+	previous := domain.TaskStatusInProgress
+	if status == domain.TaskStatusInProgress {
+		previous = domain.TaskStatusAccepted
+	}
+	return domain.TaskUpdate{
+		ID: uuid.NewString(), TaskID: task.ID, TenantID: task.TenantID, TaskType: task.Type,
+		PreviousStatus: previous, Status: status, OccurredAt: time.Now(),
+	}
+}
+
 // complete drives task through in_progress to status, as the worker would.
 func (s services) complete(t *testing.T, taskID string, status domain.TaskStatus) {
 	t.Helper()
+	task, err := s.tasks.Get(t.Context(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, st := range []domain.TaskStatus{domain.TaskStatusInProgress, status} {
-		got, err := s.tasks.ApplyUpdate(t.Context(), domain.TaskUpdate{ID: uuid.NewString(), TaskID: taskID, Status: st})
+		got, err := s.tasks.ApplyUpdate(t.Context(), workerUpdate(task, st))
 		if err != nil || got != application.UpdateApplied {
 			t.Fatalf("apply %s: %s, %v", st, got, err)
 		}
@@ -256,7 +273,7 @@ func TestAppConcurrentDuplicateUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	update := domain.TaskUpdate{ID: uuid.NewString(), TaskID: m.Task.ID, Status: domain.TaskStatusDone}
+	update := workerUpdate(m.Task, domain.TaskStatusDone)
 
 	outcomes := make([]application.UpdateOutcome, 16)
 	errs := parallel(len(outcomes), func(i int) error {
@@ -291,7 +308,7 @@ func TestAppConcurrentDistinctUpdates(t *testing.T) {
 	}
 	statuses := []domain.TaskStatus{domain.TaskStatusInProgress, domain.TaskStatusDone, domain.TaskStatusDone, domain.TaskStatusFailed}
 	errs := parallel(len(statuses), func(i int) error {
-		_, err := s.tasks.ApplyUpdate(t.Context(), domain.TaskUpdate{ID: uuid.NewString(), TaskID: m.Task.ID, Status: statuses[i]})
+		_, err := s.tasks.ApplyUpdate(t.Context(), workerUpdate(m.Task, statuses[i]))
 		return err
 	})
 	for i, err := range errs {
@@ -319,7 +336,7 @@ func TestAppRejectedUpdateRollsBack(t *testing.T) {
 	if _, err := s.pool.Exec(t.Context(), `UPDATE tenants SET status = 'active', version = version + 1 WHERE id = $1`, m.Tenant.ID); err != nil {
 		t.Fatal(err)
 	}
-	update := domain.TaskUpdate{ID: uuid.NewString(), TaskID: m.Task.ID, Status: domain.TaskStatusDone}
+	update := workerUpdate(m.Task, domain.TaskStatusDone)
 
 	if _, err := s.tasks.ApplyUpdate(t.Context(), update); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("err = %v, want ErrInvalidTransition", err)
@@ -352,7 +369,8 @@ func TestAppMalformedIDsAreNotFound(t *testing.T) {
 	if _, err := s.tasks.Get(ctx, "not-a-uuid"); !errors.Is(err, domain.ErrTaskNotFound) {
 		t.Errorf("get task: %v", err)
 	}
-	if _, err := s.tasks.ApplyUpdate(ctx, domain.TaskUpdate{ID: "u1", TaskID: "not-a-uuid", Status: domain.TaskStatusDone}); !errors.Is(err, domain.ErrTaskNotFound) {
+	malformed := workerUpdate(domain.Task{ID: "not-a-uuid", TenantID: uuid.NewString(), Type: domain.TaskTypeDeploy}, domain.TaskStatusDone)
+	if _, err := s.tasks.ApplyUpdate(ctx, malformed); !errors.Is(err, domain.ErrTaskNotFound) {
 		t.Errorf("apply update: %v", err)
 	}
 }

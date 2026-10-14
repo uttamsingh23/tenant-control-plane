@@ -40,6 +40,58 @@ func TestLoadAPI_Defaults(t *testing.T) {
 	if cfg.Outbox != wantOutbox {
 		t.Errorf("Outbox = %+v, want %+v", cfg.Outbox, wantOutbox)
 	}
+	wantInbound := Inbound{
+		Concurrency: 4, MaxAttempts: 10, RetryMin: 200 * time.Millisecond, RetryMax: 10 * time.Second,
+		ApplyTimeout: 10 * time.Second, ShutdownTimeout: 10 * time.Second,
+	}
+	if cfg.Inbound != wantInbound {
+		t.Errorf("Inbound = %+v, want %+v", cfg.Inbound, wantInbound)
+	}
+}
+
+func TestLoadAPI_Inbound(t *testing.T) {
+	cfg, err := LoadAPI(env(map[string]string{
+		"DATABASE_URL":             "postgres://u:p@localhost/db",
+		"RABBITMQ_URL":             "amqp://u:p@localhost:5672/",
+		"INBOUND_CONCURRENCY":      "8",
+		"INBOUND_MAX_ATTEMPTS":     "3",
+		"INBOUND_RETRY_MIN":        "50ms",
+		"INBOUND_RETRY_MAX":        "1s",
+		"INBOUND_APPLY_TIMEOUT":    "2s",
+		"INBOUND_SHUTDOWN_TIMEOUT": "4s",
+	}))
+	if err != nil {
+		t.Fatalf("LoadAPI: %v", err)
+	}
+	want := Inbound{
+		Concurrency: 8, MaxAttempts: 3, RetryMin: 50 * time.Millisecond, RetryMax: time.Second,
+		ApplyTimeout: 2 * time.Second, ShutdownTimeout: 4 * time.Second,
+	}
+	if cfg.Inbound != want {
+		t.Errorf("Inbound = %+v, want %+v", cfg.Inbound, want)
+	}
+}
+
+func TestLoadAPI_InboundValidation(t *testing.T) {
+	for _, concurrency := range []string{"0", "-1", "65"} {
+		_, err := LoadAPI(env(map[string]string{
+			"DATABASE_URL":          "postgres://u:p@localhost/db",
+			"RABBITMQ_URL":          "amqp://u:p@localhost:5672/",
+			"INBOUND_CONCURRENCY":   concurrency,
+			"INBOUND_MAX_ATTEMPTS":  "0",
+			"INBOUND_RETRY_MIN":     "1m",
+			"INBOUND_RETRY_MAX":     "1s",
+			"INBOUND_APPLY_TIMEOUT": "never",
+		}))
+		if err == nil {
+			t.Fatalf("concurrency %s: expected error", concurrency)
+		}
+		for _, want := range []string{"INBOUND_CONCURRENCY", "INBOUND_MAX_ATTEMPTS", "INBOUND_RETRY_MIN", "INBOUND_APPLY_TIMEOUT"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("concurrency %s: error %q does not mention %s", concurrency, err, want)
+			}
+		}
+	}
 }
 
 func TestLoadAPI_OutboxValidation(t *testing.T) {

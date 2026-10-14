@@ -68,7 +68,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	consumer := rabbitmq.NewUpdateConsumer(cfg.RabbitMQURL, tasks, logger)
+	consumer := rabbitmq.NewUpdateConsumer(cfg.RabbitMQURL, rabbitmq.DefaultTopology(), tasks, rabbitmq.UpdateConsumerOptions{
+		Concurrency:     cfg.Inbound.Concurrency,
+		MaxAttempts:     cfg.Inbound.MaxAttempts,
+		RetryMin:        cfg.Inbound.RetryMin,
+		RetryMax:        cfg.Inbound.RetryMax,
+		ApplyTimeout:    cfg.Inbound.ApplyTimeout,
+		ShutdownTimeout: cfg.Inbound.ShutdownTimeout,
+	}, logger)
 
 	var background sync.WaitGroup
 	runBackground(ctx, &background, logger, "outbox relay", relay.Run)

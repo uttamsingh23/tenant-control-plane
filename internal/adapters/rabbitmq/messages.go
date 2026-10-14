@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/uttamsingh23/tenant-control-plane/internal/application"
 	"github.com/uttamsingh23/tenant-control-plane/internal/domain"
 )
 
@@ -133,4 +134,61 @@ func NewTaskUpdateMessage(u domain.TaskUpdate) TaskUpdateMessage {
 		Reason:         u.Reason,
 		OccurredAt:     domain.FormatTimestamp(u.OccurredAt),
 	}
+}
+
+// DecodeTaskUpdateMessage parses and validates a progress update against
+// docs/schemas/task-update.v1.json. messageID and correlationID are the
+// AMQP message-id and correlation-id properties; when set, they must equal
+// the body's message_id and task_id. Every error wraps
+// ErrMalformedMessage: no redelivery can make such a message valid.
+//
+// It checks the message on its own. Whether the update fits the task on
+// record (same tenant and type, not stale) is for the application to say.
+func DecodeTaskUpdateMessage(messageID, correlationID string, body []byte) (domain.TaskUpdate, error) {
+	var m TaskUpdateMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return domain.TaskUpdate{}, malformed("task update is not a JSON object: %v", err)
+	}
+	if m.SchemaVersion != UpdateSchemaVersion {
+		return domain.TaskUpdate{}, malformed("task update schema_version must be %d, got %d", UpdateSchemaVersion, m.SchemaVersion)
+	}
+	switch {
+	case m.MessageID == "" || len(m.MessageID) > application.MaxUpdateIDLength:
+		return domain.TaskUpdate{}, malformed("task update message_id must be 1-%d characters", application.MaxUpdateIDLength)
+	case messageID != "" && messageID != m.MessageID:
+		return domain.TaskUpdate{}, malformed("task update message-id %q does not match body message_id %q", messageID, m.MessageID)
+	case m.TaskID == "" || len(m.TaskID) > MaxTaskIDLength:
+		return domain.TaskUpdate{}, malformed("update %s: task_id must be 1-%d characters", m.MessageID, MaxTaskIDLength)
+	case correlationID != "" && correlationID != m.TaskID:
+		return domain.TaskUpdate{}, malformed("update %s: correlation-id %q does not match task_id %q", m.MessageID, correlationID, m.TaskID)
+	case m.TenantID == "":
+		return domain.TaskUpdate{}, malformed("update %s: tenant_id must not be empty", m.MessageID)
+	case !domain.TaskType(m.TaskType).Valid():
+		return domain.TaskUpdate{}, malformed("update %s: task_type must be deploy, update or destroy, got %q", m.MessageID, m.TaskType)
+	}
+	previous, status := domain.TaskStatus(m.PreviousStatus), domain.TaskStatus(m.Status)
+	switch {
+	case status != domain.TaskStatusInProgress && !status.Terminal():
+		return domain.TaskUpdate{}, malformed("update %s: status must be in_progress, done or failed, got %q", m.MessageID, m.Status)
+	case !previous.CanTransitionTo(status):
+		return domain.TaskUpdate{}, malformed("update %s: %q -> %q is not a task transition", m.MessageID, m.PreviousStatus, m.Status)
+	case status == domain.TaskStatusFailed && m.Reason == "":
+		return domain.TaskUpdate{}, malformed("update %s: a failed update must carry a reason", m.MessageID)
+	case status != domain.TaskStatusFailed && m.Reason != "":
+		return domain.TaskUpdate{}, malformed("update %s: only a failed update carries a reason", m.MessageID)
+	}
+	occurredAt, err := domain.ParseTimestamp(m.OccurredAt)
+	if err != nil {
+		return domain.TaskUpdate{}, malformed("update %s: occurred_at: %v", m.MessageID, err)
+	}
+	return domain.TaskUpdate{
+		ID:             m.MessageID,
+		TaskID:         m.TaskID,
+		TenantID:       m.TenantID,
+		TaskType:       domain.TaskType(m.TaskType),
+		PreviousStatus: previous,
+		Status:         status,
+		Reason:         m.Reason,
+		OccurredAt:     occurredAt,
+	}, nil
 }

@@ -4,11 +4,9 @@ A control-plane service that records tenants, emits provisioning tasks over
 RabbitMQ and applies progress reported back by a worker simulator.
 
 > **Status:** the domain, PostgreSQL persistence, application use cases,
-> the HTTP API, outbound messaging (transactional outbox -> RabbitMQ) and
-> the worker simulator are implemented and tested. The control plane's
-> inbound update consumer is still a stub: the worker's progress updates
-> accumulate in the `tenant.task-updates.control-plane` queue, and tenants
-> stay in `provisioning` when run locally.
+> the HTTP API, outbound messaging (transactional outbox -> RabbitMQ), the
+> worker simulator and the inbound update consumer are implemented and
+> tested. Creating a tenant walks the full lifecycle with no manual steps.
 
 ## Quick start
 
@@ -50,8 +48,9 @@ internal/
   worker/           provisioning simulator logic
 migrations/         SQL schema migrations
 docs/schemas/       JSON Schemas of the task event and the progress update
-tests/              end-to-end tests: HTTP API (real router, services, PostgreSQL)
-                    and outbound messaging (API -> outbox -> relay -> RabbitMQ)
+tests/              end-to-end tests: HTTP API (real router, services, PostgreSQL),
+                    outbound messaging (API -> outbox -> relay -> RabbitMQ) and
+                    inbound messaging (worker update -> RabbitMQ -> consumer -> PostgreSQL)
 ```
 
 Dependencies point inwards: `adapters → application → domain`. Interfaces
@@ -69,10 +68,10 @@ shared `ports` package:
 ## Design
 
 - **Transactional outbox.** See [Outbound messaging](#outbound-messaging).
-- **Idempotent consumer** (planned). Every worker update carries an ID. It
-  is recorded in the same transaction that applies the update, so
-  redeliveries are no-ops. Updates for terminal tasks or that would move a
-  task backwards are ignored.
+- **Idempotent consumer.** Every worker update carries a stable ID. It is
+  recorded in the same transaction that applies the update, so
+  redeliveries are no-ops. Updates for terminal tasks, or that would move
+  a task backwards, are ignored. See [Inbound messaging](#inbound-messaging).
 - **Optimistic locking.** `UPDATE ... WHERE id = $1 AND version = $2`. Zero
   affected rows means `tenant_version_conflict`.
 
@@ -391,9 +390,10 @@ Other knobs:
   `not json`). It appears in `tenant.dead-letter` and the worker keeps
   running.
 
-Until the inbound consumer exists, the tenant stays in `provisioning`
-whichever outcome the worker reports. The updates wait in
-`tenant.task-updates.control-plane`.
+With `--fail-rate=1` the tenant ends `failed` (version 2); with
+`--fail-rate=0` it ends `active` (version 2). To replay duplicates, stale
+or conflicting updates by hand, see
+[Reproducing inbound scenarios](#reproducing-inbound-scenarios).
 
 ### Tests
 
@@ -413,6 +413,221 @@ whichever outcome the worker reports. The updates wait in
 The simulator tests use a scripted random source and a fake clock and
 sleep, so they are deterministic and never wait. The `TestWorker*` tests run
 against a real RabbitMQ.
+
+## Inbound messaging
+
+The control plane consumes the worker's progress updates from
+`tenant.task-updates.control-plane` (`rabbitmq.UpdateConsumer`) and
+applies each one with `TaskService.ApplyUpdate`.
+
+```
+ tenant.task-updates.control-plane ──> UpdateConsumer (prefetch N, N handlers, manual ack)
+        │                                 │ decode + validate (task-update.v1.json)
+        │                                 │     └── malformed ─────────────────────────> reject ──> tenant.dead-letter
+        │                                 v
+        │                    ApplyUpdate, one PostgreSQL transaction:
+        │                      1. INSERT message_id INTO processed_updates  (seen before: duplicate)
+        │                      2. SELECT task FOR UPDATE; check tenant_id, task_type
+        │                      3. advance task  (reached or passed: stale / conflict)
+        │                      4. terminal: move tenant, version + 1 (optimistic lock)
+        │                    COMMIT
+        │                                 │
+        │                                 ├── ok (applied, duplicate, stale, conflict) ──> ack
+        │                                 ├── permanent (task not found, mismatch) ─────> reject ──> tenant.dead-letter
+        └──── requeue <── MaxAttempts ────┴── retryable (DB down, timeout) ──> backoff, retry in-process
+```
+
+### At-least-once delivery, idempotent consumer
+
+**This is not exactly-once processing, and it does not try to be.** The
+broker delivers each update *at least* once. The worker republishes
+updates when a task is redelivered to it, the broker redelivers anything
+unacked when a consumer dies, and the ack itself can be lost. What the
+consumer guarantees is that *applying* an update is idempotent. However
+many times an update arrives, and in whatever order, the database ends
+in the state it would reach if each logical update had arrived exactly
+once, in order. That is "effectively once" for the state, not once for
+the message.
+
+It rests on three things:
+
+1. **A stable idempotency key.** `message_id` is derived from the task
+   (`<task_id>:in_progress`, `<task_id>:outcome`), so every copy of a
+   logical update carries the same key (see
+   [why](#update-message-schema)).
+2. **The key and the effect commit together.** `processed_updates` is
+   written in the same transaction as the task and tenant changes. A key
+   is recorded if and only if its effect is. If the transaction rolls
+   back, the key goes with it, and a retry is applied rather than skipped.
+   Concurrent deliveries of one key block on the primary key: one commits,
+   and the others see `duplicate`.
+3. **Ack after commit.** A delivery is acked only after `ApplyUpdate`
+   returns. The one window left is a crash after the commit and before
+   the ack, and it is harmless: the broker redelivers, the key is already
+   there, and the redelivery is acked as `duplicate` with no further
+   change.
+
+Deduplication by key alone is not enough, because two *different* keys
+can describe the same or contradicting progress (a hand-published update,
+or a worker of another version). So the state machine is a second line of
+defence:
+
+| Situation | Outcome | Effect |
+| --- | --- | --- |
+| first delivery of a valid update | `applied` | task advances; on `done`/`failed` the tenant moves and its version increments |
+| same `message_id` again | `duplicate` | none |
+| task already at or past the status (`in_progress` after `done`, `done` twice) | `stale` | none, key recorded |
+| terminal outcome contradicting the recorded one (`failed` after `done`) | `conflict` | none, key recorded, logged as a warning: the first outcome wins |
+| outcome overtakes its `in_progress` | `applied` | task steps `accepted -> in_progress -> done` in one transaction; the late `in_progress` is then `stale` |
+| update for a terminal task after its tenant moved on | `stale` | none; the tenant is not dragged back |
+
+Behind that, the database refuses regressions on its own: a trigger
+freezes terminal tasks, another forces every tenant write to increment
+`version` by exactly one, and a partial unique index allows only one open
+task per tenant. Outcome mapping: deploy `done` -> `active`, update
+`done` -> `active`, destroy `done` -> `destroyed`, any `failed` ->
+`failed`.
+
+### Settling a delivery
+
+| Result | Settlement | Why |
+| --- | --- | --- |
+| applied, duplicate, stale, conflict | **ack** | dealt with; the database is in its final state |
+| malformed (not JSON, unknown `schema_version`, illegal transition, `message_id`/`correlation_id` disagreeing with the body, bad timestamp, ...) | **reject -> `tenant.dead-letter`** | no redelivery can make it valid |
+| permanent: task not found, `tenant_id`/`task_type` not matching the task, tenant not expecting the outcome | **reject -> `tenant.dead-letter`** | retrying cannot fix it; key not recorded, so it can be replayed once fixed |
+| retryable: lost connection, timeout, version conflict, anything unrecognised | **retry in-process** with backoff (`INBOUND_RETRY_MIN` doubling to `INBOUND_RETRY_MAX`) | an outage is not the message's fault |
+| still retryable after `INBOUND_MAX_ATTEMPTS`, or shutting down | **nack, requeue** | do not hold a slot forever |
+
+**Poison-message policy for an unknown task: dead-letter it at once.**
+Tasks are committed before their event is published (outbox), and the
+worker only reports on tasks it received. So "task not found" is never a
+race that a retry would win. The message comes from another environment,
+was published by hand, or refers to a database restored from an older
+backup. Acking it would hide the problem, and retrying would spin. In
+the dead-letter queue it can be inspected, and once the cause is fixed,
+republished to `tenant.task-updates`. Replay is safe, because the
+consumer is idempotent.
+
+**No infinite loops.** Every retry waits (capped exponential backoff).
+After `INBOUND_MAX_ATTEMPTS` the delivery is requeued, so other updates
+get through. The quorum queue's delivery limit (20 in RabbitMQ 4) is the
+final bound: a message that fails on every delivery is dead-lettered with
+reason `delivery_limit`. With the defaults that takes about 14 minutes of
+continuous failure. A longer database outage parks the affected messages
+in `tenant.dead-letter` rather than losing them, and they can be replayed.
+
+### Crash windows
+
+| Crash point | What happens |
+| --- | --- |
+| before the commit | transaction rolls back (key included); delivery unacked, redelivered, applied |
+| after the commit, before the ack | redelivered; key found; acked as `duplicate`; tenant changed once (`TestInboundCrashAfterCommitBeforeAck`) |
+| commit outcome unknown (connection lost during `COMMIT`) | retried; either applied now or found as `duplicate` |
+| after the ack | nothing left to do |
+
+### Concurrency and shutdown
+
+- `INBOUND_CONCURRENCY` handlers (default 4) share one channel with that
+  prefetch. Several control-plane processes can consume the same queue.
+  Updates for one task are serialized by the task row lock
+  (`SELECT ... FOR UPDATE`), and the tenant write is version-checked.
+- Shutdown (SIGINT/SIGTERM): the consumer stops taking deliveries. Updates
+  being applied get `INBOUND_SHUTDOWN_TIMEOUT` (default 10s) to commit and
+  ack, and a retry backoff in progress is cut short and its delivery
+  requeued. Closing the connection then returns every unsettled delivery
+  to the queue.
+- A lost broker connection is re-established with capped backoff; unacked
+  deliveries are redelivered meanwhile.
+
+### Reproducing inbound scenarios
+
+With `make up`, `make run-api` and `make run-worker` running, create a
+tenant and let it reach `active`. Then publish updates directly to the
+broker through the management API:
+
+```bash
+TENANT=$(curl -s -XPOST localhost:8080/v1/tenants -H 'content-type: application/json' \
+  -d '{"slug":"replay-demo","name":"Replay demo"}' | jq -r .tenant.id)
+sleep 5   # let the worker finish: two waits of 0.5-2s each by default
+TASK=$(curl -s "localhost:8080/v1/tasks?tenant_id=$TENANT" | jq -r '.items[0].id')
+
+# publish <message_id> <task_id> <previous_status> <status> [reason]
+publish() {
+  jq -nc --arg id "$1" --arg task "$2" --arg tenant "$TENANT" --arg prev "$3" --arg st "$4" --arg reason "${5:-}" '
+    {schema_version:1, message_id:$id, task_id:$task, tenant_id:$tenant, task_type:"deploy",
+     previous_status:$prev, status:$st, occurred_at:"2026-01-01T00:00:00.000Z"}
+    + (if $reason == "" then {} else {reason:$reason} end)
+    | {properties:{message_id:$id, content_type:"application/json", delivery_mode:2},
+       routing_key:"task_update.manual", payload:tojson, payload_encoding:"string"}' |
+  curl -s -u control_plane:local-dev-only -H 'content-type: application/json' \
+    -XPOST localhost:15672/api/exchanges/%2F/tenant.task-updates/publish -d @-
+}
+
+publish "$TASK:outcome"  "$TASK" in_progress done            # duplicate: "duplicate task update ignored"
+publish manual-stale-1   "$TASK" accepted    in_progress      # stale:     "stale task update ignored"
+publish manual-conflict  "$TASK" in_progress failed "late"    # conflict:  WARN "conflicting task outcome ignored"
+publish manual-ghost "$(uuidgen | tr A-Z a-z)" in_progress done   # unknown task: dead-lettered
+curl -s -u control_plane:local-dev-only -H 'content-type: application/json' -XPOST \
+  localhost:15672/api/exchanges/%2F/tenant.task-updates/publish \
+  -d '{"properties":{"message_id":"garbage-1"},"routing_key":"task_update.x","payload":"not json","payload_encoding":"string"}'
+                                                              # malformed: dead-lettered
+
+curl -s localhost:8080/v1/tenants/$TENANT                     # still active, version 2
+
+# Inspect the dead letters (requeued, so they stay):
+curl -s -u control_plane:local-dev-only -H 'content-type: application/json' \
+  -XPOST localhost:15672/api/queues/%2F/tenant.dead-letter/get \
+  -d '{"count":10,"ackmode":"ack_requeue_true","encoding":"auto"}' | jq '.[] | {id: .properties.message_id, reason: .properties.headers["x-first-death-reason"]}'
+```
+
+To see a transient database failure, stop PostgreSQL (`docker compose stop
+postgres`) while a tenant is provisioning. The API logs "applying task
+update failed, retrying" with growing delays. After `docker compose start
+postgres` the update is applied, and nothing is dead-lettered.
+
+### Tests
+
+| Behaviour | Test |
+| --- | --- |
+| duplicate delivery: applied once, repeats acked as duplicates, nothing changes | `TestInboundDuplicateDelivery`, `TestApplyUpdateDuplicateChangesNothing`, `TestAppConcurrentDuplicateUpdates` |
+| stale delivery: late `in_progress` after `done`, outcome before `in_progress` | `TestInboundStaleDelivery`, `TestApplyUpdate`, `TestApplyUpdateOutOfOrder` |
+| terminal-state protection: duplicate, conflicting and late outcomes; tenant not regressed after moving on | `TestInboundTerminalProtection`, `TestApplyUpdate` (stale/conflict rows) |
+| task not found and tenant/type mismatch: dead-lettered after one attempt, nothing recorded | `TestInboundTaskNotFound`, `TestConsumerDeadLettersPermanentFailures`, `TestApplyUpdateRejectsWithoutPartialMutation` |
+| transient database failure: retried with backoff, applied when the database is back, nothing dead-lettered | `TestInboundTransientDatabaseFailure`, `TestConsumerRetriesTransientFailures`, `TestConsumerRequeuesAfterMaxAttempts` |
+| bounded retries: a message failing forever is dead-lettered by the delivery limit | `TestConsumerFailingForeverIsBounded` |
+| malformed messages: decoder agrees with the JSON Schema; dead-lettered with reason `rejected` | `TestDecodeTaskUpdateMessageAgreesWithSchema`, `TestDecodeTaskUpdateMessageChecksProperties`, `TestConsumerDeadLettersMalformedUpdates` |
+| concurrent deliveries: two consumers x 4 handlers, every update 3 times, racing outcomes | `TestInboundConcurrentDeliveries`, `TestConsumerAppliesConcurrently`, `TestAppConcurrentDistinctUpdates` |
+| crash after commit, before ack: redelivered, duplicate, tenant changed once | `TestInboundCrashAfterCommitBeforeAck` |
+| graceful shutdown: in-flight update finishes; timeout and backoff requeue | `TestConsumerShutdownFinishesInFlightUpdate`, `TestConsumerShutdownTimeoutRequeues`, `TestConsumerShutdownDuringBackoff` |
+| broker down at startup, connection lost | `TestConsumerReconnects` |
+| outcome mapping and version increments, through the API | `TestInboundLifecycle` |
+| whole system: API -> outbox -> worker -> consumer, fail rate 0 and 1 | `TestInboundFullLoop` |
+| error classification | `TestIsPermanentUpdateError` |
+
+To check the tests catch real bugs, I broke 14 safeguards one at a time
+(acking before applying, requeueing malformed messages, retrying
+permanent failures, dead-lettering transient ones, no backoff, unbounded
+attempts, no shutdown grace, a single handler, treating every error as
+permanent, ignoring the idempotency key, skipping the tenant/type check,
+merging conflict into stale, not moving the tenant, and dropping a
+decoder rule). Each one made at least one test fail.
+
+### Trade-offs and limits
+
+- **Dead-lettering is at-most-once in RabbitMQ by default.** If the
+  dead-letter queue could not accept a message, the broker would drop it.
+  The at-least-once dead-letter strategy needs `x-overflow: reject-publish`
+  on the source queue, and changing the arguments of an existing queue
+  forces it to be recreated. Worth doing in production; not done here.
+- **Head-of-line blocking is bounded, not eliminated.** A retrying update
+  holds one of `INBOUND_CONCURRENCY` slots for up to `INBOUND_MAX_ATTEMPTS`
+  attempts before it is requeued.
+- **`processed_updates` grows without bound.** Keys are small, and a key
+  only needs to outlive any redelivery of its message, so a periodic
+  `DELETE ... WHERE processed_at < now() - interval '30 days'` would be
+  safe. It is not implemented.
+- **The first terminal outcome wins.** A conflicting late outcome is
+  logged, not applied. A real system might also raise an alert.
 
 ## HTTP API
 
@@ -633,6 +848,11 @@ No credentials are committed; `.env` is git-ignored.
 | `OUTBOX_LEASE`            | `30s`   | api: claim duration; must exceed 2 x `OUTBOX_PUBLISH_TIMEOUT` |
 | `OUTBOX_PUBLISH_TIMEOUT`  | `5s`    | api: bound on one publish incl. confirm, and on the mark |
 | `OUTBOX_RETRY_MIN` / `OUTBOX_RETRY_MAX` | `500ms` / `30s` | api: retry backoff bounds |
+| `INBOUND_CONCURRENCY`     | `4`     | api: updates applied in parallel (and prefetch), 1-64 |
+| `INBOUND_MAX_ATTEMPTS`    | `10`    | api: in-process attempts per delivery before it is requeued |
+| `INBOUND_RETRY_MIN` / `INBOUND_RETRY_MAX` | `200ms` / `10s` | api: retry and reconnect backoff bounds |
+| `INBOUND_APPLY_TIMEOUT`   | `10s`   | api: bound on one attempt to apply an update |
+| `INBOUND_SHUTDOWN_TIMEOUT` | `10s`  | api: time in-flight updates may finish after SIGTERM |
 | `LOG_LEVEL`               | `info`  | api, worker |
 | `WORKER_FAIL_RATE` / `--fail-rate`         | `0`    | worker: probability in [0,1] that a task fails |
 | `WORKER_MIN_DELAY_MS` / `--min-delay-ms`   | `500`  | worker: lower bound of each of the two waits |

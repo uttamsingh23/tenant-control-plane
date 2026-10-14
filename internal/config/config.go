@@ -45,12 +45,30 @@ type Outbox struct {
 	RetryMax time.Duration
 }
 
+// Inbound configures the consumer of worker progress updates.
+type Inbound struct {
+	// Concurrency is how many updates are applied in parallel.
+	Concurrency int
+	// MaxAttempts is how often one delivery is retried in-process before
+	// it is requeued.
+	MaxAttempts int
+	// RetryMin and RetryMax bound the exponential retry backoff.
+	RetryMin time.Duration
+	RetryMax time.Duration
+	// ApplyTimeout bounds one attempt to apply an update.
+	ApplyTimeout time.Duration
+	// ShutdownTimeout is how long in-flight updates may finish after a
+	// shutdown signal.
+	ShutdownTimeout time.Duration
+}
+
 // API is the configuration of the control-plane process.
 type API struct {
 	HTTP        HTTP
 	DatabaseURL string
 	RabbitMQURL string
 	Outbox      Outbox
+	Inbound     Inbound
 	LogLevel    slog.Level
 }
 
@@ -77,6 +95,9 @@ type Worker struct {
 	ShutdownTimeout time.Duration
 	LogLevel        slog.Level
 }
+
+// MaxInboundConcurrency bounds INBOUND_CONCURRENCY.
+const MaxInboundConcurrency = 64
 
 // MaxWorkerDelay bounds --max-delay-ms: a simulated step longer than an
 // hour is a typo, and the bound keeps the conversion to time.Duration far
@@ -106,6 +127,14 @@ func LoadAPI(getenv Getenv) (API, error) {
 			RetryMin:       r.duration("OUTBOX_RETRY_MIN", 500*time.Millisecond),
 			RetryMax:       r.duration("OUTBOX_RETRY_MAX", 30*time.Second),
 		},
+		Inbound: Inbound{
+			Concurrency:     r.int("INBOUND_CONCURRENCY", 4),
+			MaxAttempts:     r.int("INBOUND_MAX_ATTEMPTS", 10),
+			RetryMin:        r.duration("INBOUND_RETRY_MIN", 200*time.Millisecond),
+			RetryMax:        r.duration("INBOUND_RETRY_MAX", 10*time.Second),
+			ApplyTimeout:    r.duration("INBOUND_APPLY_TIMEOUT", 10*time.Second),
+			ShutdownTimeout: r.duration("INBOUND_SHUTDOWN_TIMEOUT", 10*time.Second),
+		},
 		LogLevel: r.logLevel("LOG_LEVEL", slog.LevelInfo),
 	}
 	if cfg.HTTP.RequestTimeout >= cfg.HTTP.WriteTimeout {
@@ -122,6 +151,18 @@ func LoadAPI(getenv Getenv) (API, error) {
 	if o := cfg.Outbox; o.RetryMin > o.RetryMax {
 		r.errs = append(r.errs, fmt.Errorf("OUTBOX_RETRY_MIN (%v) must not exceed OUTBOX_RETRY_MAX (%v)",
 			o.RetryMin, o.RetryMax))
+	}
+	// The upper bound keeps the prefetch count and the database pool
+	// demand sane; a typo like 4000 is caught here.
+	if in := cfg.Inbound; in.Concurrency < 1 || in.Concurrency > MaxInboundConcurrency {
+		r.errs = append(r.errs, fmt.Errorf("INBOUND_CONCURRENCY must be within [1,%d], got %d", MaxInboundConcurrency, in.Concurrency))
+	}
+	if in := cfg.Inbound; in.MaxAttempts < 1 {
+		r.errs = append(r.errs, fmt.Errorf("INBOUND_MAX_ATTEMPTS must be positive, got %d", in.MaxAttempts))
+	}
+	if in := cfg.Inbound; in.RetryMin > in.RetryMax {
+		r.errs = append(r.errs, fmt.Errorf("INBOUND_RETRY_MIN (%v) must not exceed INBOUND_RETRY_MAX (%v)",
+			in.RetryMin, in.RetryMax))
 	}
 	if err := r.err(); err != nil {
 		return API{}, err

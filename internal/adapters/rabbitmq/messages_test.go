@@ -264,3 +264,153 @@ func TestDecodeTaskMessageRejectsMalformed(t *testing.T) {
 		})
 	}
 }
+
+// TestDecodeTaskUpdateMessageRoundTrip: every update a real simulator
+// emits decodes back to the update it encoded.
+func TestDecodeTaskUpdateMessageRoundTrip(t *testing.T) {
+	for _, rate := range []float64{0, 1} {
+		var sent []domain.TaskUpdate
+		rec := updateRecorder(func(u domain.TaskUpdate) { sent = append(sent, u) })
+		sim, err := worker.NewSimulator(config.Simulation{FailRate: rate}, rec, rand.New(rand.NewPCG(1, 1)),
+			slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sim.Process(t.Context(), newTask(t, domain.TaskTypeDestroy)); err != nil {
+			t.Fatal(err)
+		}
+		for _, u := range sent {
+			got, err := rabbitmq.DecodeTaskUpdateMessage(u.ID, u.TaskID, marshal(t, rabbitmq.NewTaskUpdateMessage(u)))
+			if err != nil {
+				t.Fatalf("decode %s: %v", u.ID, err)
+			}
+			if !got.OccurredAt.Equal(u.OccurredAt) {
+				t.Errorf("occurred_at %v, want %v", got.OccurredAt, u.OccurredAt)
+			}
+			got.OccurredAt = u.OccurredAt
+			if got != u {
+				t.Errorf("decoded %+v, want %+v", got, u)
+			}
+		}
+	}
+}
+
+type updateRecorder func(domain.TaskUpdate)
+
+func (r updateRecorder) PublishUpdate(_ context.Context, u domain.TaskUpdate) error {
+	r(u)
+	return nil
+}
+
+// TestDecodeTaskUpdateMessageAgreesWithSchema: the decoder accepts exactly
+// what docs/schemas/task-update.v1.json accepts, for every case below,
+// and reports each rejection as ErrMalformedMessage so the consumer
+// dead-letters it.
+func TestDecodeTaskUpdateMessageAgreesWithSchema(t *testing.T) {
+	sch := compileSchema(t, taskUpdateSchema)
+	base := map[string]any{
+		"schema_version": 1, "message_id": "t:outcome", "task_id": "t", "tenant_id": "tn",
+		"task_type": "update", "previous_status": "in_progress", "status": "done",
+		"occurred_at": "2026-01-02T03:04:05.006Z",
+	}
+	with := func(changes map[string]any) []byte {
+		m := map[string]any{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for k, v := range changes {
+			if v == nil {
+				delete(m, k)
+			} else {
+				m[k] = v
+			}
+		}
+		return marshal(t, m)
+	}
+	tests := []struct {
+		name  string
+		body  []byte
+		valid bool
+	}{
+		{"baseline done", with(nil), true},
+		{"in_progress", with(map[string]any{"status": "in_progress", "previous_status": "accepted", "message_id": "t:in_progress"}), true},
+		{"failed with reason", with(map[string]any{"status": "failed", "reason": "quota exceeded"}), true},
+		{"unknown property", with(map[string]any{"attempt": 3}), true},
+
+		{"empty body", nil, false},
+		{"not JSON", []byte("task t is done"), false},
+		{"JSON null", []byte("null"), false},
+		{"JSON array", []byte(`[{"status":"done"}]`), false},
+		{"missing schema_version", with(map[string]any{"schema_version": nil}), false},
+		{"future schema_version", with(map[string]any{"schema_version": 2}), false},
+		{"schema_version as string", with(map[string]any{"schema_version": "1"}), false},
+		{"missing message_id", with(map[string]any{"message_id": nil}), false},
+		{"empty message_id", with(map[string]any{"message_id": ""}), false},
+		{"message_id too long", with(map[string]any{"message_id": strings.Repeat("x", 201)}), false},
+		{"missing task_id", with(map[string]any{"task_id": nil}), false},
+		{"task_id too long", with(map[string]any{"task_id": strings.Repeat("x", rabbitmq.MaxTaskIDLength+1)}), false},
+		{"task_id of wrong type", with(map[string]any{"task_id": 7}), false},
+		{"missing tenant_id", with(map[string]any{"tenant_id": nil}), false},
+		{"unknown task_type", with(map[string]any{"task_type": "resize"}), false},
+		{"missing status", with(map[string]any{"status": nil}), false},
+		{"status accepted", with(map[string]any{"status": "accepted", "previous_status": "accepted"}), false},
+		{"unknown status", with(map[string]any{"status": "exploded"}), false},
+		{"missing previous_status", with(map[string]any{"previous_status": nil}), false},
+		{"done straight from accepted", with(map[string]any{"previous_status": "accepted"}), false},
+		{"done from done", with(map[string]any{"previous_status": "done"}), false},
+		{"in_progress from in_progress", with(map[string]any{"status": "in_progress"}), false},
+		{"failed without reason", with(map[string]any{"status": "failed"}), false},
+		{"failed with empty reason", with(map[string]any{"status": "failed", "reason": ""}), false},
+		{"reason on done", with(map[string]any{"reason": "because"}), false},
+		{"missing occurred_at", with(map[string]any{"occurred_at": nil}), false},
+		{"occurred_at without millis", with(map[string]any{"occurred_at": "2026-01-02T03:04:05Z"}), false},
+		{"occurred_at with offset", with(map[string]any{"occurred_at": "2026-01-02T03:04:05.006+01:00"}), false},
+		{"occurred_at not a time", with(map[string]any{"occurred_at": "yesterday"}), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schemaErr := errors.New("not JSON")
+			if json.Valid(tt.body) {
+				schemaErr = validate(t, sch, tt.body)
+			}
+			if (schemaErr == nil) != tt.valid {
+				t.Errorf("schema valid = %v, want %v (%v)", schemaErr == nil, tt.valid, schemaErr)
+			}
+			_, err := rabbitmq.DecodeTaskUpdateMessage("", "", tt.body)
+			if (err == nil) != tt.valid {
+				t.Errorf("decoder err = %v, want valid = %v", err, tt.valid)
+			}
+			if err != nil && !errors.Is(err, rabbitmq.ErrMalformedMessage) {
+				t.Errorf("err = %v, want ErrMalformedMessage", err)
+			}
+		})
+	}
+}
+
+// TestDecodeTaskUpdateMessageChecksProperties: the AMQP message-id and
+// correlation-id must agree with the body when they are set; unset (say,
+// published by hand) the body alone counts.
+func TestDecodeTaskUpdateMessageChecksProperties(t *testing.T) {
+	body := marshal(t, rabbitmq.NewTaskUpdateMessage(domain.TaskUpdate{
+		ID: "t:in_progress", TaskID: "t", TenantID: "tn", TaskType: domain.TaskTypeDeploy,
+		PreviousStatus: domain.TaskStatusAccepted, Status: domain.TaskStatusInProgress, OccurredAt: created,
+	}))
+	tests := []struct {
+		messageID, correlationID string
+		valid                    bool
+	}{
+		{"t:in_progress", "t", true},
+		{"", "", true},
+		{"t:outcome", "t", false},
+		{"t:in_progress", "other-task", false},
+	}
+	for _, tt := range tests {
+		_, err := rabbitmq.DecodeTaskUpdateMessage(tt.messageID, tt.correlationID, body)
+		if (err == nil) != tt.valid {
+			t.Errorf("message-id %q, correlation-id %q: err = %v, want valid = %v", tt.messageID, tt.correlationID, err, tt.valid)
+		}
+		if err != nil && !errors.Is(err, rabbitmq.ErrMalformedMessage) {
+			t.Errorf("err = %v, want ErrMalformedMessage", err)
+		}
+	}
+}

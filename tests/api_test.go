@@ -4,8 +4,8 @@
 // services, PostgreSQL) over a real connection with httptest.Server. The
 // broker is not involved: where the brief has the worker report progress,
 // the tests call TaskService.ApplyUpdate directly, which is what the
-// update consumer will do. Outbound publication through RabbitMQ is
-// covered in outbox_test.go.
+// update consumer does. Outbound publication through RabbitMQ is covered
+// in outbox_test.go, inbound consumption in consumer_test.go.
 package tests
 
 import (
@@ -169,8 +169,17 @@ func (a *api) getTask(id string) taskJSON {
 // the task, as separate updates with their own idempotency keys.
 func (a *api) finish(taskID string, outcome domain.TaskStatus) {
 	a.t.Helper()
+	task, err := a.tasks.Get(a.t.Context(), taskID)
+	if err != nil {
+		a.t.Fatal(err)
+	}
+	previous := domain.TaskStatusAccepted
 	for _, status := range []domain.TaskStatus{domain.TaskStatusInProgress, outcome} {
-		update := domain.TaskUpdate{ID: uuid.NewString(), TaskID: taskID, Status: status, OccurredAt: time.Now()}
+		update := domain.TaskUpdate{
+			ID: uuid.NewString(), TaskID: taskID, TenantID: task.TenantID, TaskType: task.Type,
+			PreviousStatus: previous, Status: status, OccurredAt: time.Now(),
+		}
+		previous = status
 		if _, err := a.tasks.ApplyUpdate(a.t.Context(), update); err != nil {
 			a.t.Fatalf("apply %s to task %s: %v", status, taskID, err)
 		}
