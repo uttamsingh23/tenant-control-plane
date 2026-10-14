@@ -8,8 +8,11 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // Getenv looks up an environment variable; os.Getenv satisfies it.
@@ -55,6 +58,8 @@ type API struct {
 type Simulation struct {
 	// FailRate is the probability in [0, 1] that a task ends in failed.
 	FailRate float64
+	// MinDelay and MaxDelay bound the random delay before each progress
+	// update (in_progress, then the outcome).
 	MinDelay time.Duration
 	MaxDelay time.Duration
 }
@@ -63,8 +68,20 @@ type Simulation struct {
 type Worker struct {
 	RabbitMQURL string
 	Simulation  Simulation
-	LogLevel    slog.Level
+	// Seed seeds the simulator's random source; 0 picks a random seed.
+	// The same seed and the same task sequence give the same delays and
+	// outcomes.
+	Seed uint64
+	// ShutdownTimeout is how long an in-flight task may keep running
+	// after a shutdown signal before it is abandoned and requeued.
+	ShutdownTimeout time.Duration
+	LogLevel        slog.Level
 }
+
+// MaxWorkerDelay bounds --max-delay-ms: a simulated step longer than an
+// hour is a typo, and the bound keeps the conversion to time.Duration far
+// from overflowing.
+const MaxWorkerDelay = time.Hour
 
 // LoadAPI reads the control-plane configuration from the environment.
 func LoadAPI(getenv Getenv) (API, error) {
@@ -113,7 +130,8 @@ func LoadAPI(getenv Getenv) (API, error) {
 }
 
 // LoadWorker reads the worker configuration. Environment variables provide
-// defaults; command-line flags in args override them.
+// defaults; command-line flags in args override them. Every invalid value
+// is reported, not just the first.
 func LoadWorker(args []string, getenv Getenv) (Worker, error) {
 	r := reader{getenv: getenv}
 	cfg := Worker{
@@ -123,27 +141,46 @@ func LoadWorker(args []string, getenv Getenv) (Worker, error) {
 	failRate := r.float("WORKER_FAIL_RATE", 0)
 	minDelayMS := r.int("WORKER_MIN_DELAY_MS", 500)
 	maxDelayMS := r.int("WORKER_MAX_DELAY_MS", 2000)
+	seed := r.uint64("WORKER_SEED", 0)
+	shutdownTimeout := r.duration("WORKER_SHUTDOWN_TIMEOUT", 10*time.Second)
 	if err := r.err(); err != nil {
 		return Worker{}, err
 	}
 
 	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
 	fs.Float64Var(&failRate, "fail-rate", failRate, "probability in [0,1] that a task fails (env WORKER_FAIL_RATE)")
-	fs.IntVar(&minDelayMS, "min-delay-ms", minDelayMS, "minimum delay per task step in ms (env WORKER_MIN_DELAY_MS)")
-	fs.IntVar(&maxDelayMS, "max-delay-ms", maxDelayMS, "maximum delay per task step in ms (env WORKER_MAX_DELAY_MS)")
+	fs.IntVar(&minDelayMS, "min-delay-ms", minDelayMS, "minimum delay before each progress update in ms (env WORKER_MIN_DELAY_MS)")
+	fs.IntVar(&maxDelayMS, "max-delay-ms", maxDelayMS, "maximum delay before each progress update in ms (env WORKER_MAX_DELAY_MS)")
+	fs.Uint64Var(&seed, "seed", seed, "random seed for delays and outcomes; 0 picks one (env WORKER_SEED)")
+	fs.DurationVar(&shutdownTimeout, "shutdown-timeout", shutdownTimeout,
+		"how long an in-flight task may finish after SIGTERM before it is requeued (env WORKER_SHUTDOWN_TIMEOUT)")
 	if err := fs.Parse(args); err != nil {
 		return Worker{}, err
 	}
+	if fs.NArg() > 0 {
+		return Worker{}, fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
 
 	var errs []error
-	if failRate < 0 || failRate > 1 {
+	if _, err := amqp.ParseURI(cfg.RabbitMQURL); err != nil {
+		errs = append(errs, fmt.Errorf("RABBITMQ_URL is not a valid AMQP URL: %w", err))
+	}
+	// NaN fails every comparison, so it must be rejected explicitly.
+	if math.IsNaN(failRate) || failRate < 0 || failRate > 1 {
 		errs = append(errs, fmt.Errorf("fail-rate must be within [0,1], got %v", failRate))
 	}
+	maxMS := int(MaxWorkerDelay / time.Millisecond)
 	if minDelayMS < 0 || maxDelayMS < 0 {
-		errs = append(errs, errors.New("delays must not be negative"))
+		errs = append(errs, errors.New("min-delay-ms and max-delay-ms must not be negative"))
+	}
+	if minDelayMS > maxMS || maxDelayMS > maxMS {
+		errs = append(errs, fmt.Errorf("min-delay-ms and max-delay-ms must not exceed %d (%v)", maxMS, MaxWorkerDelay))
 	}
 	if minDelayMS > maxDelayMS {
 		errs = append(errs, fmt.Errorf("min-delay-ms (%d) must not exceed max-delay-ms (%d)", minDelayMS, maxDelayMS))
+	}
+	if shutdownTimeout < 0 {
+		errs = append(errs, fmt.Errorf("shutdown-timeout must not be negative, got %v", shutdownTimeout))
 	}
 	if err := errors.Join(errs...); err != nil {
 		return Worker{}, err
@@ -154,6 +191,8 @@ func LoadWorker(args []string, getenv Getenv) (Worker, error) {
 		MinDelay: time.Duration(minDelayMS) * time.Millisecond,
 		MaxDelay: time.Duration(maxDelayMS) * time.Millisecond,
 	}
+	cfg.Seed = seed
+	cfg.ShutdownTimeout = shutdownTimeout
 	return cfg, nil
 }
 
@@ -201,6 +240,19 @@ func (r *reader) int(key string, def int) int {
 	n, err := strconv.Atoi(v)
 	if err != nil {
 		r.errs = append(r.errs, fmt.Errorf("%s must be an integer, got %q", key, v))
+		return def
+	}
+	return n
+}
+
+func (r *reader) uint64(key string, def uint64) uint64 {
+	v := r.getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		r.errs = append(r.errs, fmt.Errorf("%s must be a non-negative integer, got %q", key, v))
 		return def
 	}
 	return n

@@ -93,15 +93,20 @@ func setup(external string) error {
 	return err
 }
 
-// Topology returns exchange and queue names unique to the test. They are
-// deleted when the test ends.
+// Topology returns exchange and queue names unique to the test, for every
+// object of the topology. They are deleted when the test ends.
 func Topology(t *testing.T) rabbitmq.Topology {
 	t.Helper()
 	brokerURL := URL(t)
 	n := harness.counter.Add(1)
+	prefix := fmt.Sprintf("test.%d.%d.", os.Getpid(), n)
 	topo := rabbitmq.Topology{
-		Exchange: fmt.Sprintf("test.%d.%d.tasks", os.Getpid(), n),
-		Queue:    fmt.Sprintf("test.%d.%d.tasks.worker", os.Getpid(), n),
+		Exchange:           prefix + "tasks",
+		Queue:              prefix + "tasks.worker",
+		UpdateExchange:     prefix + "task-updates",
+		UpdateQueue:        prefix + "task-updates.control-plane",
+		DeadLetterExchange: prefix + "dead-letter",
+		DeadLetterQueue:    prefix + "dead-letter",
 	}
 	t.Cleanup(func() {
 		conn, err := amqp.Dial(brokerURL)
@@ -110,8 +115,12 @@ func Topology(t *testing.T) rabbitmq.Topology {
 		}
 		defer func() { _ = conn.Close() }()
 		if ch, err := conn.Channel(); err == nil {
-			_, _ = ch.QueueDelete(topo.Queue, false, false, false)
-			_ = ch.ExchangeDelete(topo.Exchange, false, false)
+			for _, q := range []string{topo.Queue, topo.UpdateQueue, topo.DeadLetterQueue} {
+				_, _ = ch.QueueDelete(q, false, false, false)
+			}
+			for _, x := range []string{topo.Exchange, topo.UpdateExchange, topo.DeadLetterExchange} {
+				_ = ch.ExchangeDelete(x, false, false)
+			}
 		}
 	})
 	return topo

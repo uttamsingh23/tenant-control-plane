@@ -15,30 +15,6 @@ import (
 	"github.com/uttamsingh23/tenant-control-plane/internal/domain"
 )
 
-// TaskMessage is the JSON body of a task event. The task is the event: the
-// body carries the task as it was when the event was recorded, and its id
-// is also the AMQP message-id, the stable key consumers deduplicate on.
-type TaskMessage struct {
-	ID        string `json:"id"`
-	Type      string `json:"type"`
-	TenantID  string `json:"tenant_id"`
-	Status    string `json:"status"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
-}
-
-// NewTaskMessage converts a task to its wire form.
-func NewTaskMessage(t domain.Task) TaskMessage {
-	return TaskMessage{
-		ID:        t.ID,
-		Type:      string(t.Type),
-		TenantID:  t.TenantID,
-		Status:    string(t.Status),
-		CreatedAt: domain.FormatTimestamp(t.CreatedAt),
-		UpdatedAt: domain.FormatTimestamp(t.UpdatedAt),
-	}
-}
-
 // TaskEventType is the AMQP type property of task events.
 const TaskEventType = "task"
 
@@ -49,8 +25,8 @@ const appID = "tenant-control-plane"
 // context has no deadline.
 const defaultDialTimeout = 30 * time.Second
 
-// ErrPublisherClosed is returned by PublishTask after Close.
-var ErrPublisherClosed = errors.New("task publisher closed")
+// ErrPublisherClosed is returned by a publish after Close.
+var ErrPublisherClosed = errors.New("publisher closed")
 
 // TaskPublisher publishes task events to RabbitMQ with publisher confirms.
 //
@@ -59,12 +35,47 @@ var ErrPublisherClosed = errors.New("task publisher closed")
 // connection is opened on first use and reopened after any failure, so a
 // broker that is down when the control plane starts, or restarts later,
 // only causes publish errors (which the relay retries) until it is back.
+type TaskPublisher struct {
+	pub *confirmPublisher
+}
+
+// NewTaskPublisher returns a publisher for the broker at url. It does not
+// connect until the first publish.
+func NewTaskPublisher(url string, topology Topology, logger *slog.Logger) *TaskPublisher {
+	return &TaskPublisher{pub: newConfirmPublisher(url, appID+" task publisher", topology, logger)}
+}
+
+// PublishTask implements application.TaskPublisher. Every error is worth
+// retrying: none of them means the event can never be delivered.
+func (p *TaskPublisher) PublishTask(ctx context.Context, task domain.Task) error {
+	body, err := json.Marshal(NewTaskMessage(task))
+	if err != nil {
+		return fmt.Errorf("encode task %s: %w", task.ID, err)
+	}
+	return p.pub.publish(ctx, "task", p.pub.topology.Exchange, TaskRoutingKey(task.Type), amqp.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp.Persistent,
+		MessageId:    task.ID,
+		Type:         TaskEventType,
+		AppId:        appID,
+		Timestamp:    task.UpdatedAt,
+		Body:         body,
+	})
+}
+
+// Close closes the connection. Later publishes fail with ErrPublisherClosed.
+func (p *TaskPublisher) Close() error { return p.pub.close() }
+
+// confirmPublisher publishes messages one at a time and waits for the
+// broker's confirmation of each. It is shared by the control plane's
+// TaskPublisher and the worker's UpdatePublisher.
 //
 // Publishes are serialized on one channel. That keeps confirm and return
 // handling simple (one message in flight) at the cost of throughput,
-// which is ample for provisioning events.
-type TaskPublisher struct {
+// which is ample for provisioning traffic.
+type confirmPublisher struct {
 	url      string
+	connName string
 	topology Topology
 	logger   *slog.Logger
 
@@ -75,25 +86,17 @@ type TaskPublisher struct {
 	returns chan amqp.Return
 }
 
-// NewTaskPublisher returns a publisher for the broker at url. It does not
-// connect until the first publish.
-func NewTaskPublisher(url string, topology Topology, logger *slog.Logger) *TaskPublisher {
-	return &TaskPublisher{url: url, topology: topology, logger: logger}
+func newConfirmPublisher(url, connName string, topology Topology, logger *slog.Logger) *confirmPublisher {
+	return &confirmPublisher{url: url, connName: connName, topology: topology, logger: logger}
 }
 
-// PublishTask implements application.TaskPublisher.
+// publish sends msg and returns nil only once the broker has confirmed it.
+// kind ("task", "update") names the message in errors.
 //
-// The message is persistent and published with the mandatory flag, so an
-// unroutable message (say, the queue was deleted) is returned by the
-// broker and reported as an error instead of being acknowledged and
-// dropped. Every error is worth retrying: none of them means the event
-// can never be delivered.
-func (p *TaskPublisher) PublishTask(ctx context.Context, task domain.Task) error {
-	body, err := json.Marshal(NewTaskMessage(task))
-	if err != nil {
-		return fmt.Errorf("encode task %s: %w", task.ID, err)
-	}
-
+// The message is published with the mandatory flag, so an unroutable
+// message (say, the queue was deleted) is returned by the broker and
+// reported as an error instead of being acknowledged and dropped.
+func (p *confirmPublisher) publish(ctx context.Context, kind, exchange, key string, msg amqp.Publishing) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -104,38 +107,31 @@ func (p *TaskPublisher) PublishTask(ctx context.Context, task domain.Task) error
 		return err
 	}
 
-	confirm, err := ch.PublishWithDeferredConfirmWithContext(ctx, p.topology.Exchange, TaskRoutingKey(task.Type),
+	id := msg.MessageId
+	confirm, err := ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key,
 		true,  // mandatory: return the message if no queue is bound
 		false, // immediate: unsupported by RabbitMQ
-		amqp.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent,
-			MessageId:    task.ID,
-			Type:         TaskEventType,
-			AppId:        appID,
-			Timestamp:    task.UpdatedAt,
-			Body:         body,
-		})
+		msg)
 	if err != nil {
 		p.reset()
-		return fmt.Errorf("publish task %s: %w", task.ID, err)
+		return fmt.Errorf("publish %s %s: %w", kind, id, err)
 	}
 	acked, err := confirm.WaitContext(ctx)
 	if err != nil {
 		// The outcome is unknown: the broker may still store the message.
 		// Drop the channel so a late confirmation cannot be mistaken for
-		// the next message's; the relay retries and the duplicate, if
+		// the next message's; the caller retries and the duplicate, if
 		// any, carries the same message-id.
 		p.reset()
-		return fmt.Errorf("wait for confirmation of task %s: %w", task.ID, err)
+		return fmt.Errorf("wait for confirmation of %s %s: %w", kind, id, err)
 	}
 	if !acked {
 		if ch.IsClosed() {
 			// Closing a channel settles its pending confirmations as nacks.
 			p.reset()
-			return fmt.Errorf("publish task %s: channel closed before confirmation", task.ID)
+			return fmt.Errorf("publish %s %s: channel closed before confirmation", kind, id)
 		}
-		return fmt.Errorf("publish task %s: broker rejected the message (nack)", task.ID)
+		return fmt.Errorf("publish %s %s: broker rejected the message (nack)", kind, id)
 	}
 	// The broker sends basic.return before the basic.ack of the same
 	// message, and the client delivers it to p.returns synchronously, so a
@@ -143,12 +139,12 @@ func (p *TaskPublisher) PublishTask(ctx context.Context, task domain.Task) error
 	for {
 		select {
 		case ret := <-p.returns:
-			if ret.MessageId == task.ID {
+			if ret.MessageId == id {
 				// Reconnect next time, which declares the topology again
 				// and so restores a deleted queue or binding.
 				p.reset()
-				return fmt.Errorf("publish task %s: unroutable (%d %s): no queue bound to exchange %s for key %s",
-					task.ID, ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
+				return fmt.Errorf("publish %s %s: unroutable (%d %s): no queue bound to exchange %s for key %s",
+					kind, id, ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
 			}
 		default:
 			return nil
@@ -158,14 +154,14 @@ func (p *TaskPublisher) PublishTask(ctx context.Context, task domain.Task) error
 
 // channel returns an open confirm-mode channel, connecting and declaring
 // the topology first if needed. The caller holds p.mu.
-func (p *TaskPublisher) channel(ctx context.Context) (*amqp.Channel, error) {
+func (p *confirmPublisher) channel(ctx context.Context) (*amqp.Channel, error) {
 	if p.ch != nil && !p.ch.IsClosed() && !p.conn.IsClosed() {
 		return p.ch, nil
 	}
 	p.reset()
 
 	conn, err := amqp.DialConfig(p.url, amqp.Config{
-		Properties: amqp.Table{"connection_name": appID + " task publisher"},
+		Properties: amqp.Table{"connection_name": p.connName},
 		Dial:       dialer(ctx),
 	})
 	if err != nil {
@@ -188,21 +184,20 @@ func (p *TaskPublisher) channel(ctx context.Context) (*amqp.Channel, error) {
 	// message in flight, at most one return is pending at a time.
 	p.returns = ch.NotifyReturn(make(chan amqp.Return, 1))
 	p.conn, p.ch = conn, ch
-	p.logger.Info("task publisher connected to broker",
-		"exchange", p.topology.Exchange, "queue", p.topology.Queue)
+	p.logger.Info("publisher connected to broker", "connection", p.connName)
 	return ch, nil
 }
 
 // reset closes the connection, if any. The caller holds p.mu.
-func (p *TaskPublisher) reset() {
+func (p *confirmPublisher) reset() {
 	if p.conn != nil {
 		_ = p.conn.Close()
 	}
 	p.conn, p.ch, p.returns = nil, nil, nil
 }
 
-// Close closes the connection. Later publishes fail with ErrPublisherClosed.
-func (p *TaskPublisher) Close() error {
+// close closes the connection. Later publishes fail with ErrPublisherClosed.
+func (p *confirmPublisher) close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true

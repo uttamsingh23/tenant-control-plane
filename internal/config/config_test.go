@@ -107,19 +107,123 @@ func TestLoadWorker_FlagsOverrideEnv(t *testing.T) {
 	}
 }
 
-func TestLoadWorker_Validation(t *testing.T) {
-	base := env(map[string]string{"RABBITMQ_URL": "amqp://localhost/"})
-	tests := map[string][]string{
-		"fail rate above 1": {"--fail-rate=1.5"},
-		"negative delay":    {"--min-delay-ms=-1"},
-		"min above max":     {"--min-delay-ms=100", "--max-delay-ms=10"},
+func TestLoadWorker_Defaults(t *testing.T) {
+	cfg, err := LoadWorker(nil, env(map[string]string{"RABBITMQ_URL": "amqp://localhost/"}))
+	if err != nil {
+		t.Fatalf("LoadWorker: %v", err)
 	}
-	for name, args := range tests {
-		t.Run(name, func(t *testing.T) {
-			if _, err := LoadWorker(args, base); err == nil {
+	want := Simulation{FailRate: 0, MinDelay: 500 * time.Millisecond, MaxDelay: 2 * time.Second}
+	if cfg.Simulation != want {
+		t.Errorf("Simulation = %+v, want %+v", cfg.Simulation, want)
+	}
+	if cfg.Seed != 0 || cfg.ShutdownTimeout != 10*time.Second {
+		t.Errorf("Seed, ShutdownTimeout = %d, %v; want 0, 10s", cfg.Seed, cfg.ShutdownTimeout)
+	}
+}
+
+// TestLoadWorker_DelayConfiguration: delays are given in milliseconds from
+// env or flags, and both bounds may be equal (a fixed delay) or zero.
+func TestLoadWorker_DelayConfiguration(t *testing.T) {
+	tests := []struct {
+		name     string
+		env      map[string]string
+		args     []string
+		min, max time.Duration
+	}{
+		{"env", map[string]string{"WORKER_MIN_DELAY_MS": "10", "WORKER_MAX_DELAY_MS": "20"}, nil, 10 * time.Millisecond, 20 * time.Millisecond},
+		{"flags", nil, []string{"--min-delay-ms=30", "--max-delay-ms=40"}, 30 * time.Millisecond, 40 * time.Millisecond},
+		{"flag overrides one env value", map[string]string{"WORKER_MIN_DELAY_MS": "10", "WORKER_MAX_DELAY_MS": "20"},
+			[]string{"--max-delay-ms=50"}, 10 * time.Millisecond, 50 * time.Millisecond},
+		{"fixed delay", nil, []string{"--min-delay-ms=25", "--max-delay-ms=25"}, 25 * time.Millisecond, 25 * time.Millisecond},
+		{"no delay", nil, []string{"--min-delay-ms=0", "--max-delay-ms=0"}, 0, 0},
+		{"upper limit", nil, []string{"--min-delay-ms=0", "--max-delay-ms=3600000"}, 0, MaxWorkerDelay},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"RABBITMQ_URL": "amqp://localhost/"}
+			for k, v := range tt.env {
+				vars[k] = v
+			}
+			cfg, err := LoadWorker(tt.args, env(vars))
+			if err != nil {
+				t.Fatalf("LoadWorker: %v", err)
+			}
+			if cfg.Simulation.MinDelay != tt.min || cfg.Simulation.MaxDelay != tt.max {
+				t.Errorf("delays = [%v, %v], want [%v, %v]", cfg.Simulation.MinDelay, cfg.Simulation.MaxDelay, tt.min, tt.max)
+			}
+		})
+	}
+}
+
+func TestLoadWorker_SeedAndShutdownTimeout(t *testing.T) {
+	vars := env(map[string]string{
+		"RABBITMQ_URL":            "amqp://localhost/",
+		"WORKER_SEED":             "7",
+		"WORKER_SHUTDOWN_TIMEOUT": "3s",
+	})
+	cfg, err := LoadWorker(nil, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Seed != 7 || cfg.ShutdownTimeout != 3*time.Second {
+		t.Errorf("from env: Seed, ShutdownTimeout = %d, %v; want 7, 3s", cfg.Seed, cfg.ShutdownTimeout)
+	}
+	cfg, err = LoadWorker([]string{"--seed=42", "--shutdown-timeout=0s"}, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Seed != 42 || cfg.ShutdownTimeout != 0 {
+		t.Errorf("from flags: Seed, ShutdownTimeout = %d, %v; want 42, 0s", cfg.Seed, cfg.ShutdownTimeout)
+	}
+}
+
+func TestLoadWorker_Validation(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		args []string
+	}{
+		{"fail rate above 1", nil, []string{"--fail-rate=1.5"}},
+		{"fail rate below 0", nil, []string{"--fail-rate=-0.1"}},
+		{"fail rate NaN", nil, []string{"--fail-rate=NaN"}},
+		{"fail rate not a number", map[string]string{"WORKER_FAIL_RATE": "often"}, nil},
+		{"negative min delay", nil, []string{"--min-delay-ms=-1"}},
+		{"negative max delay", nil, []string{"--min-delay-ms=0", "--max-delay-ms=-1"}},
+		{"min above max", nil, []string{"--min-delay-ms=100", "--max-delay-ms=10"}},
+		{"delay above limit", nil, []string{"--max-delay-ms=3600001"}},
+		{"delay not an integer", map[string]string{"WORKER_MAX_DELAY_MS": "1s"}, nil},
+		{"negative seed", map[string]string{"WORKER_SEED": "-1"}, nil},
+		{"negative shutdown timeout", nil, []string{"--shutdown-timeout=-1s"}},
+		{"unknown flag", nil, []string{"--fail-rat=1"}},
+		{"stray argument", nil, []string{"--fail-rate", "1", "extra"}},
+		{"missing broker URL", map[string]string{"RABBITMQ_URL": ""}, nil},
+		{"invalid broker URL", map[string]string{"RABBITMQ_URL": "http://localhost/"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := map[string]string{"RABBITMQ_URL": "amqp://localhost/"}
+			for k, v := range tt.env {
+				vars[k] = v
+			}
+			if _, err := LoadWorker(tt.args, env(vars)); err == nil {
 				t.Fatal("expected error")
 			}
 		})
+	}
+}
+
+// TestLoadWorker_ReportsAllErrors: every invalid value is reported at
+// once, not just the first.
+func TestLoadWorker_ReportsAllErrors(t *testing.T) {
+	_, err := LoadWorker([]string{"--fail-rate=2", "--min-delay-ms=9", "--max-delay-ms=1", "--shutdown-timeout=-1s"},
+		env(map[string]string{"RABBITMQ_URL": "localhost"}))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{"RABBITMQ_URL", "fail-rate", "min-delay-ms (9)", "shutdown-timeout"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
 	}
 }
 

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/uttamsingh23/tenant-control-plane/docs/schemas/task-update.v1.json",
+  "title": "Task progress update",
+  "description": "Published by the worker to exchange tenant.task-updates with routing key task_update.<status>. AMQP message_id = message_id (the idempotency key), correlation_id = task_id. A task produces two updates: in_progress, then done or failed. Consumers must ignore unknown properties.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "message_id",
+    "task_id",
+    "tenant_id",
+    "task_type",
+    "previous_status",
+    "status",
+    "occurred_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "message_id": {
+      "description": "Idempotency key, unique per logical update and stable across redeliveries and worker reruns: <task_id>:in_progress or <task_id>:outcome. Both outcomes (done, failed) share the outcome ID, so only the first one recorded counts.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "task_id": {
+      "description": "ID of the task this update is about (the task event's id).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "task_type": { "enum": ["deploy", "update", "destroy"] },
+    "previous_status": {
+      "description": "Status the worker moved the task from; previous_status -> status is the reported transition.",
+      "enum": ["accepted", "in_progress"]
+    },
+    "status": { "enum": ["in_progress", "done", "failed"] },
+    "reason": {
+      "description": "Why the task failed. Present only when status is failed.",
+      "type": "string",
+      "minLength": 1
+    },
+    "occurred_at": {
+      "description": "When the worker made the transition; ISO 8601 UTC with milliseconds and a Z suffix.",
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "in_progress" } } },
+      "then": {
+        "properties": { "previous_status": { "const": "accepted" } },
+        "not": { "required": ["reason"] }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "done" } } },
+      "then": {
+        "properties": { "previous_status": { "const": "in_progress" } },
+        "not": { "required": ["reason"] }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "failed" } } },
+      "then": {
+        "properties": { "previous_status": { "const": "in_progress" } },
+        "required": ["reason"]
+      }
+    }
+  ]
+}

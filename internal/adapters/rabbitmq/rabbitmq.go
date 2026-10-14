@@ -3,7 +3,8 @@
 //
 // Control plane: TaskPublisher (outbound task events, see publisher.go) and
 // UpdateConsumer (inbound progress updates). Worker: TaskConsumer and
-// UpdatePublisher. The broker objects are described in topology.go.
+// UpdatePublisher (see worker.go). The broker objects are described in
+// topology.go and the message formats in messages.go.
 package rabbitmq
 
 import (
@@ -19,6 +20,7 @@ import (
 var (
 	_ application.TaskPublisher = (*TaskPublisher)(nil)
 	_ worker.UpdatePublisher    = (*UpdatePublisher)(nil)
+	_ TaskHandler               = (*worker.Simulator)(nil)
 )
 
 func notImplemented(op string) error {
@@ -52,36 +54,4 @@ func NewUpdateConsumer(url string, applier UpdateApplier, logger *slog.Logger) *
 // Run consumes until ctx is cancelled.
 func (c *UpdateConsumer) Run(context.Context) error {
 	return notImplemented("consume task updates")
-}
-
-// TaskConsumer consumes task events and hands them to a TaskHandler.
-type TaskConsumer struct {
-	url     string
-	handler TaskHandler
-	logger  *slog.Logger
-}
-
-// NewTaskConsumer returns a consumer for the broker at url.
-func NewTaskConsumer(url string, handler TaskHandler, logger *slog.Logger) *TaskConsumer {
-	return &TaskConsumer{url: url, handler: handler, logger: logger}
-}
-
-// Run consumes until ctx is cancelled.
-func (c *TaskConsumer) Run(context.Context) error {
-	return notImplemented("consume tasks")
-}
-
-// UpdatePublisher publishes worker progress updates.
-type UpdatePublisher struct {
-	url string
-}
-
-// NewUpdatePublisher returns a publisher for the broker at url.
-func NewUpdatePublisher(url string) *UpdatePublisher {
-	return &UpdatePublisher{url: url}
-}
-
-// PublishUpdate implements worker.UpdatePublisher.
-func (p *UpdatePublisher) PublishUpdate(context.Context, domain.TaskUpdate) error {
-	return notImplemented("publish task update")
 }

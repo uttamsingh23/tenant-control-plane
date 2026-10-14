@@ -4,10 +4,10 @@ A control-plane service that records tenants, emits provisioning tasks over
 RabbitMQ and applies progress reported back by a worker simulator.
 
 > **Status:** the domain, PostgreSQL persistence, application use cases,
-> the HTTP API and outbound messaging (transactional outbox -> RabbitMQ)
-> are implemented and tested. The inbound update consumer and the worker
-> simulator are still stubs, so task events reach the
-> `tenant.tasks.worker` queue but nothing processes them yet, and tenants
+> the HTTP API, outbound messaging (transactional outbox -> RabbitMQ) and
+> the worker simulator are implemented and tested. The control plane's
+> inbound update consumer is still a stub: the worker's progress updates
+> accumulate in the `tenant.task-updates.control-plane` queue, and tenants
 > stay in `provisioning` when run locally.
 
 ## Quick start
@@ -49,6 +49,7 @@ internal/
     tcpproxy/       TCP proxy that refuses, cuts or blackholes connections on demand
   worker/           provisioning simulator logic
 migrations/         SQL schema migrations
+docs/schemas/       JSON Schemas of the task event and the progress update
 tests/              end-to-end tests: HTTP API (real router, services, PostgreSQL)
                     and outbound messaging (API -> outbox -> relay -> RabbitMQ)
 ```
@@ -99,6 +100,7 @@ task event, and only after the change is durably committed.
 
  RabbitMQ
      exchange tenant.tasks (topic, durable) --task.#--> queue tenant.tasks.worker (quorum, durable)
+     (the worker's side is described under Worker simulator)
 ```
 
 ### Why an outbox
@@ -189,8 +191,22 @@ harmless instead:
 | Object | Name | Properties |
 | --- | --- | --- |
 | Exchange | `tenant.tasks` | topic, durable |
-| Queue | `tenant.tasks.worker` | quorum (replicated, always durable), bound with `task.#` |
+| Queue | `tenant.tasks.worker` | quorum (replicated, always durable), bound with `task.#`, dead-letters to `tenant.dead-letter` |
 | Routing key | `task.<type>` | `task.deploy`, `task.update`, `task.destroy` |
+| Exchange | `tenant.task-updates` | topic, durable; the worker publishes progress here |
+| Queue | `tenant.task-updates.control-plane` | quorum, bound with `task_update.#`, dead-letters to `tenant.dead-letter` |
+| Routing key | `task_update.<status>` | `task_update.in_progress`, `task_update.done`, `task_update.failed` |
+| Exchange + queue | `tenant.dead-letter` | fanout exchange and quorum queue; rejected messages and messages over the delivery limit |
+
+Both processes declare the whole topology on every connect, so neither
+depends on the other having started first.
+
+> **Upgrading a local broker from an earlier version of this repo:** the
+> work queues gained the `x-dead-letter-exchange` argument, and RabbitMQ
+> refuses to redeclare a queue with different arguments
+> (`PRECONDITION_FAILED`). Recreate the queue: `make clean && make up`, or
+> `docker compose exec rabbitmq rabbitmqctl delete_queue tenant.tasks.worker`
+> (this drops the messages in it).
 
 The publisher declares the exchange, queue and binding on every connect
 (idempotently), so events published before any worker starts are kept, not
@@ -200,7 +216,8 @@ and the next connection re-declares the topology.
 
 AMQP properties: `message_id` = task ID, `delivery_mode` = 2 (persistent),
 `content_type` = `application/json`, `type` = `task`, `app_id` =
-`tenant-control-plane`. Body (the task as committed):
+`tenant-control-plane`. Body (the task as committed; JSON Schema:
+[`docs/schemas/task-event.v1.json`](docs/schemas/task-event.v1.json)):
 
 ```json
 {
@@ -245,6 +262,157 @@ Integration tests start PostgreSQL and RabbitMQ containers with
 testcontainers (or use `TEST_DATABASE_URL` / `TEST_RABBITMQ_URL`) and skip
 under `-short` or without Docker. Broker failures are injected with
 `testsupport/tcpproxy` between the relay and RabbitMQ.
+
+## Worker simulator
+
+`cmd/worker` is a separate process. It consumes task events from
+`tenant.tasks.worker` and simulates provisioning. For each task it waits,
+publishes `in_progress`, waits again, and then publishes `done`, or
+`failed` with probability `--fail-rate`. It never touches PostgreSQL: its
+only output is the update messages. No real cloud resources are involved.
+
+```
+ tenant.tasks.worker ──> TaskConsumer (prefetch 1, manual ack)
+                            │  decode + validate ── malformed ──> reject ──> tenant.dead-letter
+                            v
+                         Simulator.Process
+                            │  sleep [min,max] ─> publish in_progress ─┐  UpdatePublisher (own connection,
+                            │  sleep [min,max] ─> publish done|failed ─┤  confirms, persistent, mandatory)
+                            v                                          v
+                         ack (only now)                 tenant.task-updates ──> tenant.task-updates.control-plane
+```
+
+### Reliability contract (at-least-once)
+
+- A task is **acked only after both of its updates are broker-confirmed**.
+  A worker that crashes or is killed before that leaves the task unacked,
+  and RabbitMQ redelivers it, to this worker or another one.
+- A redelivered task is simulated again from the start and **republishes
+  updates with the same message IDs** (see below). Duplicates are
+  therefore expected, and the control plane discards them through its
+  `processed_updates` idempotency table.
+- **Processing failure** (for example, the update publish failed): the task
+  is requeued after a 1s pause, so a persistent failure cannot spin. The
+  quorum queue's delivery limit (20 in RabbitMQ 4) eventually
+  dead-letters a task that fails every time.
+- **Malformed message** (not JSON, unknown type, status other than
+  `accepted`, bad timestamp, `message_id` contradicting the body): it is
+  logged with a body excerpt and **rejected without requeue**. It goes to
+  `tenant.dead-letter` for inspection; it is not dropped and not retried
+  forever, and the consumer carries on with the next message.
+- **Broker unavailable or connection lost**: the consumer reconnects with
+  capped exponential backoff (500ms to 30s). Unacked deliveries return to
+  the queue in the meantime.
+- **Graceful shutdown** (SIGINT/SIGTERM): the worker stops taking new
+  deliveries. The in-flight task keeps running for up to
+  `--shutdown-timeout` (default 10s). If it finishes, it is acked. If not,
+  its context is cancelled and the task is requeued. Either way, nothing is
+  lost.
+- One task at a time per worker. To scale out, run more workers; they
+  compete for the same queue.
+
+### Update message schema
+
+JSON Schema: [`docs/schemas/task-update.v1.json`](docs/schemas/task-update.v1.json)
+(draft 2020-12). `messages_test.go` validates every encoded update against
+it, so the schema and the code cannot drift apart.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schema_version` | `1` | Bumped on an incompatible change. Unknown fields are ignored, so adding a field needs no new version. |
+| `message_id` | string, 1-200 | **Idempotency key.** `<task_id>:in_progress` or `<task_id>:outcome`. |
+| `task_id` | string | The task this update is about (the task event's `id`). |
+| `tenant_id`, `task_type` | string | Echo the task, so the consumer can check the update against its own record. |
+| `previous_status` | `accepted` \| `in_progress` | The status the worker moved the task from. |
+| `status` | `in_progress` \| `done` \| `failed` | The status it moved the task to. |
+| `reason` | string | Present only when `status` is `failed`. |
+| `occurred_at` | timestamp | When the transition happened (ISO 8601, ms, `Z`). |
+
+The schema also encodes the allowed transitions: `in_progress` requires
+`previous_status: accepted`, while `done` and `failed` require
+`previous_status: in_progress`. AMQP properties: `message_id` = the
+body's `message_id`, `correlation_id` = `task_id`, `type` = `task.update`,
+`app_id` = `tenant-worker`, `delivery_mode` = 2, routing key
+`task_update.<status>`.
+
+```json
+{"schema_version":1,"message_id":"6f1c...:in_progress","task_id":"6f1c...","tenant_id":"0b7e...",
+ "task_type":"deploy","previous_status":"accepted","status":"in_progress","occurred_at":"2026-01-02T03:04:05.006Z"}
+{"schema_version":1,"message_id":"6f1c...:outcome","task_id":"6f1c...","tenant_id":"0b7e...",
+ "task_type":"deploy","previous_status":"in_progress","status":"failed",
+ "reason":"simulated deploy failure (fail rate 1)","occurred_at":"2026-01-02T03:04:06.210Z"}
+```
+
+**Why message IDs are derived from the task, not random.** A random ID
+per publish would give a redelivered task's updates fresh IDs, so the
+control plane could not tell them apart from new updates. Instead, each
+*logical* update has exactly one ID, which survives redelivery and worker
+restarts. The outcome has a single ID whether it is `done` or `failed`. If
+a rerun draws a different outcome, its update is a duplicate of the first
+outcome and is discarded: the first outcome recorded wins.
+
+### Running it: failure and success scenarios
+
+The worker reads `WORKER_*` variables (see `.env.example`), and CLI flags
+override them. Invalid values (fail rate outside [0,1] or NaN, a negative
+delay, min > max, delays above 1h, a malformed `RABBITMQ_URL`) stop the
+worker at startup, with every problem reported at once.
+
+```bash
+make up && make run-api                               # terminal 1
+
+# Every task fails:
+make run-worker WORKER_ARGS="--fail-rate=1"           # terminal 2
+curl -s -XPOST localhost:8080/v1/tenants -H 'content-type: application/json' \
+  -d '{"slug":"fail-demo","name":"Fail demo"}'
+# worker log: "task in progress" ..., then "task finished" status=failed reason="simulated deploy failure (fail rate 1)"
+
+# Reproduce success: stop the worker (Ctrl-C; the in-flight task finishes first),
+# restart it without failures and create another tenant:
+make run-worker WORKER_ARGS="--fail-rate=0"
+curl -s -XPOST localhost:8080/v1/tenants -H 'content-type: application/json' \
+  -d '{"slug":"ok-demo","name":"OK demo"}'
+# worker log: ... status=done
+
+# Inspect the updates without consuming them (management API, requeued):
+curl -s -u control_plane:local-dev-only -H 'content-type: application/json' \
+  -XPOST localhost:15672/api/queues/%2F/tenant.task-updates.control-plane/get \
+  -d '{"count":10,"ackmode":"ack_requeue_true","encoding":"auto"}'
+```
+
+Other knobs:
+- `--min-delay-ms` / `--max-delay-ms` set the range of each of the two waits;
+  `0`/`0` makes the worker instant.
+- `--seed=N` replays the same delays and outcomes for the same sequence of
+  tasks. The seed in use, random when unset, is logged at startup.
+- `--fail-rate=0.3` fails about 30% of tasks.
+- To exercise the dead-letter path, publish a malformed task in the management
+  UI (Exchanges > `tenant.tasks`, routing key `task.deploy`, payload
+  `not json`). It appears in `tenant.dead-letter` and the worker keeps
+  running.
+
+Until the inbound consumer exists, the tenant stays in `provisioning`
+whichever outcome the worker reports. The updates wait in
+`tenant.task-updates.control-plane`.
+
+### Tests
+
+| Behaviour | Test |
+| --- | --- |
+| delay range (both bounds reachable, fixed, zero), real draws stay in range | `TestProcessDelays`, `TestProcessRealDelaysStayInRange`, `TestLoadWorker_DelayConfiguration` |
+| fail rate 0 never fails, 1 always fails, boundary, frequency, seed replay | `TestProcessFailRate`, `TestProcessSeedIsReproducible` |
+| lifecycle: in_progress then outcome, transitions follow the state machine, all task types | `TestProcessLifecycle`, `TestProcessAllTaskTypes`, `TestSimulatedLifecycleMatchesSchema` |
+| stable IDs across reruns, unique per logical update | `TestProcessStableIDs`, `TestWorkerRedeliveryRepeatsUpdateIDs` |
+| schema: encoded updates and events validate, the schema rejects invalid transitions, field names pinned | `messages_test.go` |
+| malformed task events are rejected / dead-lettered, not retried | `TestDecodeTaskMessageRejectsMalformed`, `TestWorkerDeadLettersMalformedMessages` |
+| ack only after publishing, requeue on failure | `TestWorkerReportsProgress`, `TestWorkerRequeuesFailedTask`, `TestProcessPublishFailure` |
+| graceful shutdown: in-flight task finishes, or is requeued after the timeout | `TestWorkerShutdownFinishesInFlightTask`, `TestWorkerShutdownTimeoutRequeuesTask`, `TestProcessCancelled` |
+| broker down at startup | `TestWorkerBrokerUnavailableAtStartup` |
+| configuration validation | `config_test.go` (`TestLoadWorker_*`) |
+
+The simulator tests use a scripted random source and a fake clock and
+sleep, so they are deterministic and never wait. The `TestWorker*` tests run
+against a real RabbitMQ.
 
 ## HTTP API
 
@@ -466,6 +634,8 @@ No credentials are committed; `.env` is git-ignored.
 | `OUTBOX_PUBLISH_TIMEOUT`  | `5s`    | api: bound on one publish incl. confirm, and on the mark |
 | `OUTBOX_RETRY_MIN` / `OUTBOX_RETRY_MAX` | `500ms` / `30s` | api: retry backoff bounds |
 | `LOG_LEVEL`               | `info`  | api, worker |
-| `WORKER_FAIL_RATE` / `--fail-rate`         | `0`    | worker |
-| `WORKER_MIN_DELAY_MS` / `--min-delay-ms`   | `500`  | worker |
-| `WORKER_MAX_DELAY_MS` / `--max-delay-ms`   | `2000` | worker |
+| `WORKER_FAIL_RATE` / `--fail-rate`         | `0`    | worker: probability in [0,1] that a task fails |
+| `WORKER_MIN_DELAY_MS` / `--min-delay-ms`   | `500`  | worker: lower bound of each of the two waits |
+| `WORKER_MAX_DELAY_MS` / `--max-delay-ms`   | `2000` | worker: upper bound (at most 3600000) |
+| `WORKER_SEED` / `--seed`                   | `0` (random) | worker: seed for delays and outcomes |
+| `WORKER_SHUTDOWN_TIMEOUT` / `--shutdown-timeout` | `10s` | worker: time the in-flight task may finish after SIGTERM |

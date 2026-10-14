@@ -129,7 +129,14 @@ type TaskUpdate struct {
 	// It is the idempotency key for applying the update.
 	ID     string
 	TaskID string
-	Status TaskStatus
+	// TenantID and TaskType echo the task the update is about, so a
+	// consumer can check the update against the task it has on record.
+	TenantID string
+	TaskType TaskType
+	// PreviousStatus is the status the worker moved the task from; with
+	// Status it names the transition the update reports.
+	PreviousStatus TaskStatus
+	Status         TaskStatus
 	// Reason optionally explains a failed outcome.
 	Reason     string
 	OccurredAt time.Time

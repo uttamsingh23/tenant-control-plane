@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/uttamsingh23/tenant-control-plane/docs/schemas/task-event.v1.json",
+  "title": "Task event",
+  "description": "Published by the control plane to exchange tenant.tasks with routing key task.<type> when a task is accepted. The task is the event: AMQP message_id = id. Consumers must ignore unknown properties.",
+  "type": "object",
+  "required": ["id", "type", "tenant_id", "status", "created_at", "updated_at"],
+  "properties": {
+    "id": {
+      "description": "Task ID; the stable event ID consumers deduplicate on.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "type": { "enum": ["deploy", "update", "destroy"] },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "description": "Always accepted: a task is published once, when it is created.",
+      "const": "accepted"
+    },
+    "created_at": { "$ref": "#/$defs/timestamp" },
+    "updated_at": { "$ref": "#/$defs/timestamp" }
+  },
+  "$defs": {
+    "timestamp": {
+      "description": "ISO 8601 UTC with milliseconds and a Z suffix.",
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    }
+  }
+}
