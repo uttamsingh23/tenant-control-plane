@@ -1,0 +1,11 @@
+# Local configuration (may contain credentials)
+.env
+
+# Build output
+/bin/
+/coverage.out
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
