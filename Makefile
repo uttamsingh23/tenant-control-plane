@@ -1,6 +1,8 @@
 GOLANGCI_LINT_VERSION ?= v2.14.0
 GOLANGCI_LINT         := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 WORKER_ARGS           ?=
+STRESS_COUNT          ?= 20
+RACECHECK_ARGS        ?=
 
 # Load .env (if present) and export it to every recipe. A conditional
 # include stops make from auto-creating .env via the rule below.
@@ -38,6 +40,14 @@ lint: ## Run golangci-lint (includes gosec security checks)
 .PHONY: test
 test: ## Run the test suite with the race detector
 	go test -race -count=1 ./...
+
+.PHONY: stress
+stress: ## Repeat every concurrency test STRESS_COUNT times under the race detector
+	go test -race -count=$(STRESS_COUNT) -run 'Concurrent' ./...
+
+.PHONY: race-check
+race-check: ## Hammer a running stack with concurrent requests (needs run-api and run-worker WORKER_ARGS="--fail-rate=0")
+	go run ./cmd/racecheck $(RACECHECK_ARGS)
 
 .PHONY: cover
 cover: ## Run tests with coverage report

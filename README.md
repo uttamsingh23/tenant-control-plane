@@ -18,6 +18,8 @@ make up          # start PostgreSQL and RabbitMQ, wait until healthy
 make run-api     # control plane on :8080
 make run-worker  # worker simulator, e.g. make run-worker WORKER_ARGS="--fail-rate=1"
 make check       # fmt-check + vet + golangci-lint (incl. gosec) + tests
+make stress      # every concurrency test 20 times under -race (STRESS_COUNT=n)
+make race-check  # concurrent requests against the running api + worker, see below
 ```
 
 `make help` lists all targets.
@@ -628,6 +630,42 @@ decoder rule). Each one made at least one test fail.
   safe. It is not implemented.
 - **The first terminal outcome wins.** A conflicting late outcome is
   logged, not applied. A real system might also raise an alert.
+
+## Concurrency and recovery checks
+
+The integration tests run against real PostgreSQL and RabbitMQ
+(testcontainers, or `TEST_DATABASE_URL` / `TEST_RABBITMQ_URL`); they skip
+only under `-short` or when Docker is unreachable.
+
+| Behaviour | Test |
+| --- | --- |
+| same-slug creates: one 201, every loser `tenant_already_exists`, nothing left behind | `TestConcurrentCreatesWithSameSlug`, `TestAppConcurrentCreatesSameSlug` |
+| same-version PATCHes: one 202, every loser `tenant_version_conflict`, one update task | `TestConcurrentPatchesWithSameVersion`, `TestAppConcurrentUpdatesSameVersion` |
+| PATCH or DELETE from every disallowed status, `destroyed` included | `TestInvalidStateTransitions` |
+| deploy, update and destroy failures -> `failed`, then DELETE -> `destroyed` | `TestFailureOutcomes` |
+| deploy observed step by step: `in_progress` moves the task only, `done` the tenant | `TestInboundDeployStepByStep` |
+| relay crashes after publishing: the worker runs the task twice, the domain state is as if once | `TestRecoveryPublisherCrashRedelivery` |
+| control-plane restart: same tenants, pending outbox events published and completed, the stale rerun of a pre-restart event changes nothing | `TestRecoveryRestart` |
+| rollback leaves no tenant, task or outbox row | `TestAppMutationsRollBack`, `TestWithinTxRollsBack` |
+
+`make stress` repeats every `*Concurrent*` test `STRESS_COUNT` times
+(default 20) under the race detector, to shake out interleavings a
+single run misses.
+
+`make race-check` exercises the running system instead. With
+`make run-api` and `make run-worker WORKER_ARGS="--fail-rate=0"` running,
+each round fires `-n` simultaneous creates with one slug, then PATCHes
+with one version, then DELETEs, and checks that exactly one of each wins,
+the losers get the documented error codes, the worker's outcomes bump the
+version (2, 4, 6), exactly three tasks exist, and the destroyed slug stays
+taken. It exits 1 on any violation.
+
+```bash
+make race-check RACECHECK_ARGS="-n 64 -rounds 5"
+# round 1 (rc-mv8kc2ti-0): ok
+# ...
+# all 5 rounds passed with 64 concurrent requests per step
+```
 
 ## HTTP API
 

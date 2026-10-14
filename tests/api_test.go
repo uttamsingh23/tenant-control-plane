@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -71,6 +72,7 @@ type errorJSON struct {
 type api struct {
 	t     *testing.T
 	url   string
+	srv   *httptest.Server
 	tasks *application.TaskService
 	store *postgres.Store
 	pool  *pgxpool.Pool
@@ -78,14 +80,19 @@ type api struct {
 
 func newAPI(t *testing.T) *api {
 	t.Helper()
-	pool := pgtest.NewMigratedDB(t)
+	return newAPIOn(t, pgtest.NewMigratedDB(t))
+}
+
+// newAPIOn serves the API on an existing database pool.
+func newAPIOn(t *testing.T, pool *pgxpool.Pool) *api {
+	t.Helper()
 	store := postgres.NewStore(pool)
 	tenants := application.NewTenantService(store, store, uuid.NewString, time.Now)
 	tasks := application.NewTaskService(store, store, time.Now)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(httpapi.NewRouter(tenants, tasks, logger, 5*time.Second))
 	t.Cleanup(srv.Close)
-	return &api{t: t, url: srv.URL, tasks: tasks, store: store, pool: pool}
+	return &api{t: t, url: srv.URL, srv: srv, tasks: tasks, store: store, pool: pool}
 }
 
 type response struct {
@@ -283,6 +290,45 @@ func TestDeleteFailedTenant(t *testing.T) {
 	}
 }
 
+// TestFailureOutcomes: a failed task of any type moves its tenant to
+// failed, with a version bump; from failed, DELETE still destroys it.
+func TestFailureOutcomes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		// start returns a tenant whose open task is of the type under test.
+		start func(a *api) mutationJSON
+	}{
+		{"deploy", func(a *api) mutationJSON { return a.create("deploy-fails", "D") }},
+		{"update", func(a *api) mutationJSON {
+			tn := a.activeTenant("update-fails")
+			return expect[mutationJSON](a.t, a.do(http.MethodPatch, "/v1/tenants/"+tn.ID,
+				map[string]any{"name": "New", "version": tn.Version}), http.StatusAccepted)
+		}},
+		{"destroy", func(a *api) mutationJSON {
+			tn := a.activeTenant("destroy-fails")
+			return expect[mutationJSON](a.t, a.do(http.MethodDelete, "/v1/tenants/"+tn.ID, nil), http.StatusAccepted)
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			a := newAPI(t)
+			m := tt.start(a)
+			if m.Task.Type != tt.name {
+				t.Fatalf("open task is %s, want %s", m.Task.Type, tt.name)
+			}
+			a.finish(m.Task.ID, domain.TaskStatusFailed)
+			a.wantTask(m.Task.ID, "failed")
+			failed := a.wantTenant(m.Tenant.ID, "failed", m.Tenant.Version+1)
+
+			deleted := expect[mutationJSON](t, a.do(http.MethodDelete, "/v1/tenants/"+m.Tenant.ID, nil), http.StatusAccepted)
+			if deleted.Tenant.Status != "destroying" || deleted.Tenant.Version != failed.Version+1 || deleted.Task.Type != "destroy" {
+				t.Fatalf("deleted = %+v", deleted)
+			}
+			a.finish(deleted.Task.ID, domain.TaskStatusDone)
+			a.wantTenant(m.Tenant.ID, "destroyed", failed.Version+2)
+		})
+	}
+}
+
 func TestDuplicateSlug(t *testing.T) {
 	a := newAPI(t)
 	a.create("acme", "Acme")
@@ -295,11 +341,17 @@ func TestDuplicateSlug(t *testing.T) {
 
 func TestConcurrentCreatesWithSameSlug(t *testing.T) {
 	a := newAPI(t)
-	statuses := concurrently(16, func(int) response {
+	results := concurrently(16, func(int) response {
 		return a.do(http.MethodPost, "/v1/tenants", map[string]any{"slug": "race", "name": "Race"})
 	})
-	if statuses[http.StatusCreated] != 1 || statuses[http.StatusConflict] != 15 {
-		t.Errorf("statuses = %v, want one 201 and fifteen 409", statuses)
+	if results["201"] != 1 || results["409 tenant_already_exists"] != 15 || len(results) != 2 {
+		t.Errorf("results = %v, want one 201 and fifteen 409 tenant_already_exists", results)
+	}
+	tenants := expect[listJSON[tenantJSON]](t, a.do(http.MethodGet, "/v1/tenants", nil), http.StatusOK)
+	tasks := expect[listJSON[taskJSON]](t, a.do(http.MethodGet, "/v1/tasks", nil), http.StatusOK)
+	if len(tenants.Items) != 1 || len(tasks.Items) != 1 || a.pendingEvents() != 1 {
+		t.Errorf("tenants, tasks, outbox events = %d, %d, %d; want 1 each (losers leave nothing behind)",
+			len(tenants.Items), len(tasks.Items), a.pendingEvents())
 	}
 }
 
@@ -379,7 +431,8 @@ func TestPatchValidation(t *testing.T) {
 }
 
 // TestInvalidStateTransitions checks the tenant status guards: PATCH only
-// from active, DELETE only from active or failed.
+// from active, DELETE only from active or failed. Every other status is
+// covered for each.
 func TestInvalidStateTransitions(t *testing.T) {
 	a := newAPI(t)
 
@@ -393,6 +446,10 @@ func TestInvalidStateTransitions(t *testing.T) {
 	destroying = a.getTenant(destroying.ID)
 	failed := a.create("fail", "Failed")
 	a.finish(failed.Task.ID, domain.TaskStatusFailed)
+	destroyed := a.activeTenant("gone")
+	gone := expect[mutationJSON](t, a.do(http.MethodDelete, "/v1/tenants/"+destroyed.ID, nil), http.StatusAccepted)
+	a.finish(gone.Task.ID, domain.TaskStatusDone)
+	destroyed = a.getTenant(destroyed.ID)
 
 	for _, tt := range []struct {
 		tenant tenantJSON
@@ -405,6 +462,8 @@ func TestInvalidStateTransitions(t *testing.T) {
 		{destroying, http.MethodPatch},
 		{destroying, http.MethodDelete},
 		{a.getTenant(failed.Tenant.ID), http.MethodPatch},
+		{destroyed, http.MethodPatch},
+		{destroyed, http.MethodDelete},
 	} {
 		t.Run(tt.tenant.Status+" "+tt.method, func(t *testing.T) {
 			var body any
@@ -441,14 +500,15 @@ func TestStaleVersionConflicts(t *testing.T) {
 func TestConcurrentPatchesWithSameVersion(t *testing.T) {
 	a := newAPI(t)
 	tenant := a.activeTenant("acme")
-	statuses := concurrently(16, func(i int) response {
+	results := concurrently(16, func(i int) response {
 		return a.do(http.MethodPatch, "/v1/tenants/"+tenant.ID,
 			map[string]any{"name": fmt.Sprintf("Name %d", i), "version": tenant.Version})
 	})
-	// The loser is told either that its version is stale or, if the winner
-	// committed before it read the tenant, that the tenant is now updating.
-	if statuses[http.StatusAccepted] != 1 || statuses[http.StatusConflict] != 15 {
-		t.Errorf("statuses = %v, want one 202 and fifteen 409", statuses)
+	// Every loser is told its version is stale: either its conditional
+	// write found the version moved on, or it read the winner's commit, and
+	// the version check precedes the status check.
+	if results["202"] != 1 || results["409 tenant_version_conflict"] != 15 || len(results) != 2 {
+		t.Errorf("results = %v, want one 202 and fifteen 409 tenant_version_conflict", results)
 	}
 	got := a.getTenant(tenant.ID)
 	if got.Status != "updating" || got.Version != tenant.Version+1 {
@@ -507,24 +567,31 @@ func TestPaginationAndFilters(t *testing.T) {
 	}
 }
 
-// concurrently runs n requests at once and counts the response statuses.
-func concurrently(n int, request func(i int) response) map[int]int {
+// concurrently runs n requests at once and counts the results, keyed by
+// status, plus the error code for errors: "202", "409 tenant_version_conflict".
+func concurrently(n int, request func(i int) response) map[string]int {
 	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		statuses = map[int]int{}
-		start    = make(chan struct{})
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		results = map[string]int{}
+		start   = make(chan struct{})
 	)
 	for i := range n {
 		wg.Go(func() {
 			<-start
 			res := request(i)
+			key := strconv.Itoa(res.status)
+			if res.status >= 400 {
+				var e errorJSON
+				_ = json.Unmarshal(res.body, &e)
+				key += " " + e.Error.Code
+			}
 			mu.Lock()
-			statuses[res.status]++
+			results[key]++
 			mu.Unlock()
 		})
 	}
 	close(start)
 	wg.Wait()
-	return statuses
+	return results
 }

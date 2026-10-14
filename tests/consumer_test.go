@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/uttamsingh23/tenant-control-plane/internal/adapters/postgres"
 	"github.com/uttamsingh23/tenant-control-plane/internal/adapters/rabbitmq"
@@ -268,6 +269,36 @@ func TestInboundLifecycle(t *testing.T) {
 	}
 }
 
+// TestInboundDeployStepByStep observes the deploy one report at a time
+// through the API: in_progress moves only the task (the tenant is not
+// mutated, so its version stays), and done moves both.
+func TestInboundDeployStepByStep(t *testing.T) {
+	a := newAPI(t)
+	topo := workerTopology(t)
+	log := newOutcomeLog(a.tasks)
+	stop := startConsumer(t, amqptest.URL(t), topo, log, inboundOptions())
+
+	m := a.create("steps", "Steps")
+	a.wantTask(m.Task.ID, "accepted")
+	created := a.wantTenant(m.Tenant.ID, "provisioning", 1)
+
+	send(t, topo, report(m.Task, domain.TaskStatusInProgress, ""))
+	log.wait(t, 1)
+	a.wantTask(m.Task.ID, "in_progress")
+	if got := a.getTenant(m.Tenant.ID); got != created {
+		t.Errorf("in_progress changed the tenant: %+v, was %+v", got, created)
+	}
+
+	send(t, topo, report(m.Task, domain.TaskStatusDone, ""))
+	log.wait(t, 2)
+	a.wantTask(m.Task.ID, "done")
+	a.wantTenant(m.Tenant.ID, "active", 2)
+	if got := log.count(application.UpdateApplied); got != 2 {
+		t.Errorf("%d updates applied, want 2", got)
+	}
+	assertDrained(t, topo, stop)
+}
+
 // TestInboundDuplicateDelivery: the same updates delivered several times
 // are applied once; every repeat is acked as a duplicate with no effect.
 func TestInboundDuplicateDelivery(t *testing.T) {
@@ -386,8 +417,8 @@ func TestInboundTerminalProtection(t *testing.T) {
 
 // TestInboundTaskNotFound: the poison-message policy. An update for a
 // task that does not exist, or that contradicts the task on record, is
-// dead-lettered after one attempt with nothing recorded, and the consumer
-// goes on with the next update.
+// dead-lettered after one attempt with nothing recorded; so is a message
+// that does not decode. The consumer goes on with the next update.
 func TestInboundTaskNotFound(t *testing.T) {
 	a := newAPI(t)
 	topo := workerTopology(t)
@@ -399,13 +430,19 @@ func TestInboundTaskNotFound(t *testing.T) {
 	wrongTenant := report(m.Task, domain.TaskStatusDone, "wrong-tenant")
 	wrongTenant.TenantID = uuid.NewString()
 	send(t, topo, ghost, wrongTenant)
+	// Bytes that are not an update at all never reach the application.
+	err := amqptest.Channel(t).PublishWithContext(t.Context(), topo.UpdateExchange,
+		rabbitmq.UpdateRoutingKey(domain.TaskStatusDone), true, false, amqp.Publishing{MessageId: "garbage", Body: []byte("{not json")})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	dead := amqptest.WaitForMessages(t, topo.DeadLetterQueue, 2, deliveryTimeout)
-	if len(dead) != 2 {
-		t.Fatalf("dead-letter queue holds %d messages, want 2", len(dead))
+	dead := amqptest.WaitForMessages(t, topo.DeadLetterQueue, 3, deliveryTimeout)
+	if len(dead) != 3 {
+		t.Fatalf("dead-letter queue holds %d messages, want 3", len(dead))
 	}
 	for _, d := range dead {
-		if d.MessageId != ghost.ID && d.MessageId != wrongTenant.ID {
+		if d.MessageId != ghost.ID && d.MessageId != wrongTenant.ID && d.MessageId != "garbage" {
 			t.Errorf("unexpected dead letter %s", d.MessageId)
 		}
 		if reason := d.Headers["x-first-death-reason"]; reason != "rejected" {
@@ -578,6 +615,25 @@ func TestInboundConcurrentDeliveries(t *testing.T) {
 	}
 }
 
+// startWorker runs the worker simulator, with no delays and the given
+// fail rate, until the test ends.
+func startWorker(t *testing.T, topo rabbitmq.Topology, failRate float64) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pub := rabbitmq.NewUpdatePublisher(amqptest.URL(t), topo, logger)
+	t.Cleanup(func() { _ = pub.Close() })
+	sim, err := worker.NewSimulator(config.Simulation{FailRate: failRate}, pub, rand.New(rand.NewPCG(1, 2)), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() {
+		workerDone <- rabbitmq.NewTaskConsumer(amqptest.URL(t), topo, sim, rabbitmq.TaskConsumerOptions{}, logger).Run(ctx)
+	}()
+	t.Cleanup(func() { cancel(); <-workerDone })
+}
+
 // TestInboundFullLoop: the whole system with nothing simulated but the
 // provisioning: API -> outbox -> relay -> broker -> worker simulator ->
 // broker -> update consumer -> database. --fail-rate=0 ends active,
@@ -594,22 +650,9 @@ func TestInboundFullLoop(t *testing.T) {
 		t.Run(fmt.Sprintf("fail-rate=%v", tt.failRate), func(t *testing.T) {
 			a := newAPI(t)
 			topo := workerTopology(t)
-			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			startRelay(t, a.store.Outbox(), amqptest.URL(t), topo, relayOptions())
 			startConsumer(t, amqptest.URL(t), topo, a.tasks, inboundOptions())
-
-			pub := rabbitmq.NewUpdatePublisher(amqptest.URL(t), topo, logger)
-			t.Cleanup(func() { _ = pub.Close() })
-			sim, err := worker.NewSimulator(config.Simulation{FailRate: tt.failRate}, pub, rand.New(rand.NewPCG(1, 2)), logger)
-			if err != nil {
-				t.Fatal(err)
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			workerDone := make(chan error, 1)
-			go func() {
-				workerDone <- rabbitmq.NewTaskConsumer(amqptest.URL(t), topo, sim, rabbitmq.TaskConsumerOptions{}, logger).Run(ctx)
-			}()
-			t.Cleanup(func() { cancel(); <-workerDone })
+			startWorker(t, topo, tt.failRate)
 
 			m := a.create("full-loop", "Full loop")
 			waitFor(t, "the deploy task to finish", func() bool { return a.getTask(m.Task.ID).Status == tt.wantTask })
