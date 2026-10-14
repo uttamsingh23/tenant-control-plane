@@ -42,6 +42,9 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
+	if err := postgres.Migrate(ctx, pool); err != nil {
+		return err
+	}
 	store := postgres.NewStore(pool)
 
 	tenants := application.NewTenantService(store, store)

@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/uttamsingh23/tenant-control-plane/internal/application"
-	"github.com/uttamsingh23/tenant-control-plane/internal/domain"
 )
 
 // querier is the subset of pgx shared by *pgxpool.Pool and pgx.Tx, so the
@@ -24,8 +23,16 @@ type querier interface {
 
 // NewPool parses dsn and creates a connection pool. Connections are opened
 // lazily, so this does not fail when the database is unreachable.
+//
+// Every session runs with TimeZone=UTC so that timestamps rendered or
+// truncated by the server (now(), date_trunc) are in UTC as well.
 func NewPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create postgres pool: %w", err)
 	}
@@ -49,9 +56,18 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool, repositories: repositories{q: pool}}
 }
 
-// WithinTx implements application.Transactor.
-func (s *Store) WithinTx(_ context.Context, _ func(ctx context.Context, repos application.Repositories) error) error {
-	return fmt.Errorf("postgres transaction: %w", domain.ErrNotImplemented)
+// WithinTx implements application.Transactor. It commits if fn returns nil
+// and rolls back if fn returns an error or panics; fn's error is returned
+// unchanged so callers can match domain sentinels.
+//
+// Transactions use READ COMMITTED. Concurrency correctness does not depend
+// on a stricter level: tenant writes are conditional on the version, slug
+// uniqueness and the one-open-task rule are constraints, and task updates
+// take a row lock through GetForUpdate.
+func (s *Store) WithinTx(ctx context.Context, fn func(ctx context.Context, repos application.Repositories) error) error {
+	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		return fn(ctx, repositories{q: tx})
+	})
 }
 
 // repositories binds every repository to one querier.
