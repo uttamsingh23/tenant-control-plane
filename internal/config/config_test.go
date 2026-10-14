@@ -27,8 +27,23 @@ func TestLoadAPI_Defaults(t *testing.T) {
 	if cfg.HTTP.ShutdownTimeout != 15*time.Second {
 		t.Errorf("ShutdownTimeout = %v, want 15s", cfg.HTTP.ShutdownTimeout)
 	}
+	if cfg.HTTP.RequestTimeout != 10*time.Second {
+		t.Errorf("RequestTimeout = %v, want 10s", cfg.HTTP.RequestTimeout)
+	}
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want info", cfg.LogLevel)
+	}
+}
+
+func TestLoadAPI_RequestTimeoutBelowWriteTimeout(t *testing.T) {
+	_, err := LoadAPI(env(map[string]string{
+		"DATABASE_URL":         "postgres://u:p@localhost/db",
+		"RABBITMQ_URL":         "amqp://u:p@localhost:5672/",
+		"HTTP_REQUEST_TIMEOUT": "20s",
+		"HTTP_WRITE_TIMEOUT":   "15s",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "HTTP_REQUEST_TIMEOUT") {
+		t.Fatalf("err = %v, want one mentioning HTTP_REQUEST_TIMEOUT", err)
 	}
 }
 

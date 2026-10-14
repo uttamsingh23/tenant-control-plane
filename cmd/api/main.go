@@ -64,7 +64,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTP.Addr, err)
 	}
-	srv := httpapi.NewServer(cfg.HTTP, httpapi.NewRouter(tenants, tasks, logger))
+	srv := httpapi.NewServer(cfg.HTTP, httpapi.NewRouter(tenants, tasks, logger, cfg.HTTP.RequestTimeout))
 	logger.Info("http server listening", "addr", ln.Addr().String())
 
 	serveErr := httpapi.Serve(ctx, srv, ln, cfg.HTTP.ShutdownTimeout)

@@ -172,3 +172,16 @@ func assertTransitionError(t *testing.T, err error, entity, from, trigger string
 		t.Errorf("errors.Is(err, ErrInvalidTransition) = false for %v", err)
 	}
 }
+
+func TestTaskStatusValid(t *testing.T) {
+	for _, s := range allTaskStatuses {
+		if !s.Valid() {
+			t.Errorf("%s.Valid() = false, want true", s)
+		}
+	}
+	for _, s := range []TaskStatus{"", "bogus", "Done"} {
+		if s.Valid() {
+			t.Errorf("%q.Valid() = true, want false", s)
+		}
+	}
+}

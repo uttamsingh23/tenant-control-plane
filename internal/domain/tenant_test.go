@@ -413,3 +413,16 @@ func TestTenantVersionLifecycle(t *testing.T) {
 		t.Errorf("Name = %q, want %q", tenant.Name, rename)
 	}
 }
+
+func TestTenantStatusValid(t *testing.T) {
+	for _, s := range allTenantStatuses {
+		if !s.Valid() {
+			t.Errorf("%s.Valid() = false, want true", s)
+		}
+	}
+	for _, s := range []TenantStatus{"", "bogus", "Active"} {
+		if s.Valid() {
+			t.Errorf("%q.Valid() = true, want false", s)
+		}
+	}
+}

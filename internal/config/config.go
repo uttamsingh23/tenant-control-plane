@@ -22,7 +22,11 @@ type HTTP struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 	IdleTimeout       time.Duration
-	ShutdownTimeout   time.Duration
+	// RequestTimeout bounds the context of each request, so database calls
+	// of a slow request are cancelled. It must be below WriteTimeout, or
+	// the connection is closed before the timeout response can be written.
+	RequestTimeout  time.Duration
+	ShutdownTimeout time.Duration
 }
 
 // API is the configuration of the control-plane process.
@@ -59,12 +63,17 @@ func LoadAPI(getenv Getenv) (API, error) {
 			ReadTimeout:       r.duration("HTTP_READ_TIMEOUT", 15*time.Second),
 			WriteTimeout:      r.duration("HTTP_WRITE_TIMEOUT", 15*time.Second),
 			IdleTimeout:       r.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
+			RequestTimeout:    r.duration("HTTP_REQUEST_TIMEOUT", 10*time.Second),
 			ShutdownTimeout:   r.duration("HTTP_SHUTDOWN_TIMEOUT", 15*time.Second),
 		},
 		DatabaseURL:        r.required("DATABASE_URL"),
 		RabbitMQURL:        r.required("RABBITMQ_URL"),
 		OutboxPollInterval: r.duration("OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
 		LogLevel:           r.logLevel("LOG_LEVEL", slog.LevelInfo),
+	}
+	if cfg.HTTP.RequestTimeout >= cfg.HTTP.WriteTimeout {
+		r.errs = append(r.errs, fmt.Errorf("HTTP_REQUEST_TIMEOUT (%v) must be less than HTTP_WRITE_TIMEOUT (%v)",
+			cfg.HTTP.RequestTimeout, cfg.HTTP.WriteTimeout))
 	}
 	if err := r.err(); err != nil {
 		return API{}, err

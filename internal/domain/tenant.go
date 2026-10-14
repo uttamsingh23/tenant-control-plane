@@ -26,6 +26,16 @@ const (
 	TenantStatusFailed       TenantStatus = "failed"
 )
 
+// Valid reports whether s is a known tenant status.
+func (s TenantStatus) Valid() bool {
+	switch s {
+	case TenantStatusProvisioning, TenantStatusActive, TenantStatusUpdating,
+		TenantStatusDestroying, TenantStatusDestroyed, TenantStatusFailed:
+		return true
+	}
+	return false
+}
+
 // TenantEvent is something that moves a tenant: an API request or the
 // terminal outcome of one of its tasks.
 type TenantEvent string

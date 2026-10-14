@@ -32,6 +32,15 @@ const (
 	TaskStatusFailed     TaskStatus = "failed"
 )
 
+// Valid reports whether s is a known task status.
+func (s TaskStatus) Valid() bool {
+	switch s {
+	case TaskStatusAccepted, TaskStatusInProgress, TaskStatusDone, TaskStatusFailed:
+		return true
+	}
+	return false
+}
+
 // taskTransitions is the single source of truth for the task state machine:
 //
 //	accepted    -> in_progress
