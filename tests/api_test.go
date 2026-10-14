@@ -4,7 +4,8 @@
 // services, PostgreSQL) over a real connection with httptest.Server. The
 // broker is not involved: where the brief has the worker report progress,
 // the tests call TaskService.ApplyUpdate directly, which is what the
-// update consumer will do.
+// update consumer will do. Outbound publication through RabbitMQ is
+// covered in outbox_test.go.
 package tests
 
 import (
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/uttamsingh23/tenant-control-plane/internal/adapters/httpapi"
 	"github.com/uttamsingh23/tenant-control-plane/internal/adapters/postgres"
@@ -27,8 +29,6 @@ import (
 	"github.com/uttamsingh23/tenant-control-plane/internal/domain"
 	"github.com/uttamsingh23/tenant-control-plane/internal/testsupport/pgtest"
 )
-
-func TestMain(m *testing.M) { pgtest.Main(m) }
 
 // The JSON shapes below are written out independently of the httpapi
 // types, so a change to the public contract breaks these tests.
@@ -72,17 +72,20 @@ type api struct {
 	t     *testing.T
 	url   string
 	tasks *application.TaskService
+	store *postgres.Store
+	pool  *pgxpool.Pool
 }
 
 func newAPI(t *testing.T) *api {
 	t.Helper()
-	store := postgres.NewStore(pgtest.NewMigratedDB(t))
+	pool := pgtest.NewMigratedDB(t)
+	store := postgres.NewStore(pool)
 	tenants := application.NewTenantService(store, store, uuid.NewString, time.Now)
 	tasks := application.NewTaskService(store, store, time.Now)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := httptest.NewServer(httpapi.NewRouter(tenants, tasks, logger, 5*time.Second))
 	t.Cleanup(srv.Close)
-	return &api{t: t, url: srv.URL, tasks: tasks}
+	return &api{t: t, url: srv.URL, tasks: tasks, store: store, pool: pool}
 }
 
 type response struct {

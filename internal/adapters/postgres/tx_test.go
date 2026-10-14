@@ -30,7 +30,7 @@ func createInTx(ctx context.Context, tn domain.Tenant, task domain.Task, after f
 }
 
 func TestWithinTxCommitsTenantTaskAndEvent(t *testing.T) {
-	store, _ := newStore(t)
+	store, pool := newStore(t)
 	ctx := t.Context()
 	tn := newTenant(t, "acme", base)
 	task := newTask(t, domain.TaskTypeDeploy, tn.ID, base)
@@ -45,7 +45,7 @@ func TestWithinTxCommitsTenantTaskAndEvent(t *testing.T) {
 	if got, err := store.Tasks().Get(ctx, task.ID); err != nil || got != task {
 		t.Errorf("task = %+v, %v; want %+v", got, err, task)
 	}
-	assertPendingEvents(t, store, task.ID)
+	assertPendingEvents(t, pool, task.ID)
 }
 
 func TestWithinTxRollsBack(t *testing.T) {

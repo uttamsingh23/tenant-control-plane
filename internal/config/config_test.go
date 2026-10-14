@@ -33,6 +33,33 @@ func TestLoadAPI_Defaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want info", cfg.LogLevel)
 	}
+	wantOutbox := Outbox{
+		PollInterval: 500 * time.Millisecond, BatchSize: 100, Lease: 30 * time.Second,
+		PublishTimeout: 5 * time.Second, RetryMin: 500 * time.Millisecond, RetryMax: 30 * time.Second,
+	}
+	if cfg.Outbox != wantOutbox {
+		t.Errorf("Outbox = %+v, want %+v", cfg.Outbox, wantOutbox)
+	}
+}
+
+func TestLoadAPI_OutboxValidation(t *testing.T) {
+	_, err := LoadAPI(env(map[string]string{
+		"DATABASE_URL":           "postgres://u:p@localhost/db",
+		"RABBITMQ_URL":           "amqp://u:p@localhost:5672/",
+		"OUTBOX_BATCH_SIZE":      "0",
+		"OUTBOX_LEASE":           "10s",
+		"OUTBOX_PUBLISH_TIMEOUT": "5s",
+		"OUTBOX_RETRY_MIN":       "1m",
+		"OUTBOX_RETRY_MAX":       "1s",
+	}))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{"OUTBOX_BATCH_SIZE", "OUTBOX_LEASE", "OUTBOX_RETRY_MIN"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
 }
 
 func TestLoadAPI_RequestTimeoutBelowWriteTimeout(t *testing.T) {

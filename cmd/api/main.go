@@ -52,7 +52,22 @@ func run() error {
 
 	tenants := application.NewTenantService(store, store, uuid.NewString, time.Now)
 	tasks := application.NewTaskService(store, store, time.Now)
-	relay := application.NewOutboxRelay(store, rabbitmq.NewTaskPublisher(cfg.RabbitMQURL), cfg.OutboxPollInterval, logger)
+	publisher := rabbitmq.NewTaskPublisher(cfg.RabbitMQURL, rabbitmq.DefaultTopology(), logger)
+	// Closed after the relay has stopped (deferred calls run last-in first-out).
+	defer func() { _ = publisher.Close() }()
+	// store.Outbox() runs each call in its own committed statement, so no
+	// transaction is held while the relay waits for the broker.
+	relay, err := application.NewOutboxRelay(store.Outbox(), publisher, application.OutboxRelayOptions{
+		PollInterval:   cfg.Outbox.PollInterval,
+		BatchSize:      cfg.Outbox.BatchSize,
+		Lease:          cfg.Outbox.Lease,
+		PublishTimeout: cfg.Outbox.PublishTimeout,
+		RetryMin:       cfg.Outbox.RetryMin,
+		RetryMax:       cfg.Outbox.RetryMax,
+	}, logger)
+	if err != nil {
+		return err
+	}
 	consumer := rabbitmq.NewUpdateConsumer(cfg.RabbitMQURL, tasks, logger)
 
 	var background sync.WaitGroup

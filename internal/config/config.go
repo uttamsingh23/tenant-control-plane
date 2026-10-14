@@ -29,13 +29,26 @@ type HTTP struct {
 	ShutdownTimeout time.Duration
 }
 
+// Outbox configures the relay that publishes outbox events to the broker.
+type Outbox struct {
+	PollInterval time.Duration
+	BatchSize    int
+	// Lease is how long a claimed event is reserved for one relay. It
+	// must exceed twice PublishTimeout (one publish plus its mark).
+	Lease          time.Duration
+	PublishTimeout time.Duration
+	// RetryMin and RetryMax bound the exponential retry backoff.
+	RetryMin time.Duration
+	RetryMax time.Duration
+}
+
 // API is the configuration of the control-plane process.
 type API struct {
-	HTTP               HTTP
-	DatabaseURL        string
-	RabbitMQURL        string
-	OutboxPollInterval time.Duration
-	LogLevel           slog.Level
+	HTTP        HTTP
+	DatabaseURL string
+	RabbitMQURL string
+	Outbox      Outbox
+	LogLevel    slog.Level
 }
 
 // Simulation controls the timing and outcome of simulated provisioning.
@@ -66,14 +79,32 @@ func LoadAPI(getenv Getenv) (API, error) {
 			RequestTimeout:    r.duration("HTTP_REQUEST_TIMEOUT", 10*time.Second),
 			ShutdownTimeout:   r.duration("HTTP_SHUTDOWN_TIMEOUT", 15*time.Second),
 		},
-		DatabaseURL:        r.required("DATABASE_URL"),
-		RabbitMQURL:        r.required("RABBITMQ_URL"),
-		OutboxPollInterval: r.duration("OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
-		LogLevel:           r.logLevel("LOG_LEVEL", slog.LevelInfo),
+		DatabaseURL: r.required("DATABASE_URL"),
+		RabbitMQURL: r.required("RABBITMQ_URL"),
+		Outbox: Outbox{
+			PollInterval:   r.duration("OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
+			BatchSize:      r.int("OUTBOX_BATCH_SIZE", 100),
+			Lease:          r.duration("OUTBOX_LEASE", 30*time.Second),
+			PublishTimeout: r.duration("OUTBOX_PUBLISH_TIMEOUT", 5*time.Second),
+			RetryMin:       r.duration("OUTBOX_RETRY_MIN", 500*time.Millisecond),
+			RetryMax:       r.duration("OUTBOX_RETRY_MAX", 30*time.Second),
+		},
+		LogLevel: r.logLevel("LOG_LEVEL", slog.LevelInfo),
 	}
 	if cfg.HTTP.RequestTimeout >= cfg.HTTP.WriteTimeout {
 		r.errs = append(r.errs, fmt.Errorf("HTTP_REQUEST_TIMEOUT (%v) must be less than HTTP_WRITE_TIMEOUT (%v)",
 			cfg.HTTP.RequestTimeout, cfg.HTTP.WriteTimeout))
+	}
+	if o := cfg.Outbox; o.BatchSize <= 0 {
+		r.errs = append(r.errs, fmt.Errorf("OUTBOX_BATCH_SIZE must be positive, got %d", o.BatchSize))
+	}
+	if o := cfg.Outbox; o.Lease <= 2*o.PublishTimeout {
+		r.errs = append(r.errs, fmt.Errorf("OUTBOX_LEASE (%v) must exceed twice OUTBOX_PUBLISH_TIMEOUT (%v)",
+			o.Lease, o.PublishTimeout))
+	}
+	if o := cfg.Outbox; o.RetryMin > o.RetryMax {
+		r.errs = append(r.errs, fmt.Errorf("OUTBOX_RETRY_MIN (%v) must not exceed OUTBOX_RETRY_MAX (%v)",
+			o.RetryMin, o.RetryMax))
 	}
 	if err := r.err(); err != nil {
 		return API{}, err

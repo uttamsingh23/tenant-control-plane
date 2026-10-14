@@ -192,11 +192,18 @@ func (r fakeOutbox) Enqueue(_ context.Context, t domain.Task) error {
 	return nil
 }
 
-func (fakeOutbox) ClaimPending(context.Context, int) ([]domain.Task, error) {
+// The relay's side of the outbox is exercised with fakeRelayOutbox
+// (outbox_relay_test.go); the use cases only enqueue.
+
+func (fakeOutbox) ClaimPending(context.Context, int, time.Duration) ([]OutboxEvent, error) {
 	return nil, domain.ErrNotImplemented
 }
 
 func (fakeOutbox) MarkPublished(context.Context, string) error { return domain.ErrNotImplemented }
+
+func (fakeOutbox) Reschedule(context.Context, OutboxEvent, time.Duration, error) error {
+	return domain.ErrNotImplemented
+}
 
 type fakeProcessed struct{ *fakeStore }
 

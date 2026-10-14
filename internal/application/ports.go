@@ -48,10 +48,32 @@ type TaskRepository interface {
 // the OutboxRelay only after commit.
 type OutboxRepository interface {
 	Enqueue(ctx context.Context, task domain.Task) error
-	// ClaimPending locks up to limit unpublished events for the rest of the
-	// transaction, skipping rows already claimed by another relay.
-	ClaimPending(ctx context.Context, limit int) ([]domain.Task, error)
+	// ClaimPending leases up to limit due, unpublished events to the caller
+	// for the duration of lease, oldest first. The claim is committed before
+	// ClaimPending returns, so no transaction stays open while the caller
+	// publishes. Only committed events are visible, and events leased by
+	// another claim are skipped until that lease expires.
+	ClaimPending(ctx context.Context, limit int, lease time.Duration) ([]OutboxEvent, error)
+	// MarkPublished records that the broker confirmed the event for taskID.
+	// It is idempotent and does not depend on the claim still being held:
+	// once the broker has confirmed the event, it is published.
 	MarkPublished(ctx context.Context, taskID string) error
+	// Reschedule ends the claim on event and makes it claimable again after
+	// delay. A non-nil failure counts as a failed publish attempt and is
+	// recorded; nil hands back an event that was not attempted. It does
+	// nothing if the event was published or claimed again since.
+	Reschedule(ctx context.Context, event OutboxEvent, delay time.Duration, failure error) error
+}
+
+// OutboxEvent is a claimed outbox event.
+type OutboxEvent struct {
+	// Task is the task as it was when the event was recorded; its ID is
+	// the event ID.
+	Task domain.Task
+	// Attempts is the number of failed publish attempts before this claim.
+	Attempts int
+	// ClaimToken identifies the claim that returned the event.
+	ClaimToken string
 }
 
 // ProcessedUpdateRepository records the idempotency keys of applied

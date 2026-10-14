@@ -3,11 +3,12 @@
 A control-plane service that records tenants, emits provisioning tasks over
 RabbitMQ and applies progress reported back by a worker simulator.
 
-> **Status:** the domain, PostgreSQL persistence, application use cases
-> and the HTTP API are implemented and tested. Messaging is not built yet:
-> the outbox relay, the update consumer and the worker simulator are still
-> stubs. Tasks are therefore recorded (and queued in the outbox) but not yet
-> delivered to a worker, so tenants stay in `provisioning` when run locally.
+> **Status:** the domain, PostgreSQL persistence, application use cases,
+> the HTTP API and outbound messaging (transactional outbox -> RabbitMQ)
+> are implemented and tested. The inbound update consumer and the worker
+> simulator are still stubs, so task events reach the
+> `tenant.tasks.worker` queue but nothing processes them yet, and tenants
+> stay in `provisioning` when run locally.
 
 ## Quick start
 
@@ -42,10 +43,14 @@ internal/
     httpapi/        REST API: routing, JSON encoding, error mapping, server lifecycle
     postgres/       repository + transaction implementation (pgx)
     rabbitmq/       task/update publishers and consumers
-  testsupport/pgtest/ per-test PostgreSQL databases for integration tests
+  testsupport/
+    pgtest/         per-test PostgreSQL databases for integration tests
+    amqptest/       RabbitMQ broker and per-test topologies for integration tests
+    tcpproxy/       TCP proxy that refuses, cuts or blackholes connections on demand
   worker/           provisioning simulator logic
 migrations/         SQL schema migrations
-tests/              end-to-end HTTP tests (real router, services and PostgreSQL)
+tests/              end-to-end tests: HTTP API (real router, services, PostgreSQL)
+                    and outbound messaging (API -> outbox -> relay -> RabbitMQ)
 ```
 
 Dependencies point inwards: `adapters → application → domain`. Interfaces
@@ -60,17 +65,186 @@ shared `ports` package:
 | `UpdateApplier`, `TaskHandler`                         | `rabbitmq`    | `application.TaskService`, `worker.Simulator` |
 | `UpdatePublisher`                                      | `worker`      | `rabbitmq.UpdatePublisher`    |
 
-## Planned design
+## Design
 
-- **Transactional outbox.** Each state-changing call writes the tenant, its
-  task and an outbox row in one transaction. `OutboxRelay` publishes events
-  only after commit and marks them published after broker confirmation
-  (at-least-once).
-- **Idempotent consumer.** Every worker update carries an ID. It is recorded
-  in the same transaction that applies the update, so redeliveries are no-ops.
-  Updates for terminal tasks or that would move a task backwards are ignored.
+- **Transactional outbox.** See [Outbound messaging](#outbound-messaging).
+- **Idempotent consumer** (planned). Every worker update carries an ID. It
+  is recorded in the same transaction that applies the update, so
+  redeliveries are no-ops. Updates for terminal tasks or that would move a
+  task backwards are ignored.
 - **Optimistic locking.** `UPDATE ... WHERE id = $1 AND version = $2`. Zero
   affected rows means `tenant_version_conflict`.
+
+## Outbound messaging
+
+Every state-changing API call (create, PATCH, DELETE) publishes exactly one
+task event, and only after the change is durably committed.
+
+```
+ HTTP request
+     |
+     v
+ TenantService ── one transaction ──────────────────────────────┐
+     |   INSERT/UPDATE tenants                                  │
+     |   INSERT tasks                                           │
+     |   INSERT outbox_events (task_id, status snapshot)        │
+     └─ COMMIT ─────────────────────────────────────────────────┘
+                     (201/202 returned to the client)
+
+ OutboxRelay (background, one per replica)
+     1. claim   UPDATE outbox_events SET available_at = now()+lease ...  (own short statement, committed)
+     2. publish PublishTask -> RabbitMQ, wait for publisher confirm      (no transaction open)
+     3. mark    UPDATE outbox_events SET published_at = now()            (only after the confirm)
+        or on failure: attempts+1, last_error, available_at = now()+backoff
+
+ RabbitMQ
+     exchange tenant.tasks (topic, durable) --task.#--> queue tenant.tasks.worker (quorum, durable)
+```
+
+### Why an outbox
+
+The database and the broker are two systems with no shared transaction.
+Whichever order you write them in, a crash in between leaves them
+disagreeing:
+
+| Approach | Failure | Result |
+| --- | --- | --- |
+| publish, then commit | commit fails or the process dies | the worker provisions a tenant that does not exist (the brief's "classic bug") |
+| commit, then publish in the request | broker down, or the process dies after commit | the tenant is stuck in `provisioning` forever; the event is lost |
+| **outbox**: commit the event *with* the change, publish afterwards | anything | the event exists if and only if the change committed, and is retried until it reaches the broker |
+
+The outbox row is written by the same transaction as the tenant and task
+(`recordTask` in `application/tenant_service.go`), so a rollback removes
+it too. The relay only ever sees committed rows: its claim is a separate
+statement under READ COMMITTED, so rows of in-flight transactions are
+invisible. It selects by `published_at IS NULL`, never "id above the last
+one seen", so an event whose transaction commits after a later-numbered
+one is not skipped.
+
+### Why it is still not exactly-once
+
+The outbox makes publication *reliable*, not *unique*. Marking the row
+published is a second write to the database after the broker has
+accepted the message, and nothing can make the two atomic:
+
+- **Crash between confirm and mark.** The broker has the message, the row
+  still says unpublished. When the lease expires the event is published
+  again.
+- **Lost confirmation.** The connection drops after the broker stored the
+  message but before the confirm arrives. The outcome is unknown, so the
+  relay must retry; if the first attempt landed, that is a duplicate. (The
+  transient-failure test regularly logs a few of these.)
+- **Expired lease.** A relay stalled past its lease (GC pause, network
+  partition) while another relay re-claims and publishes the same event.
+
+The only alternative to "maybe twice" is "maybe never", which the brief
+rules out. So delivery is **at-least-once**, and duplicates are made
+harmless instead:
+
+- The task ID is the event ID and the AMQP `message-id`. Every copy of
+  an event is byte-identical (it is a snapshot taken at commit time).
+- Consumers must be idempotent on that ID. The worker can skip task IDs it
+  has already handled, and the control plane's inbound side deduplicates
+  worker updates by their own IDs (`processed_updates`) and ignores stale
+  transitions.
+
+### Relay behaviour
+
+- **Claiming without holding a transaction.** A claim is one committed
+  `UPDATE ... RETURNING` that moves `available_at` to now + lease (30s) and
+  sets a fresh `claim_token`. `FOR UPDATE SKIP LOCKED` makes concurrent
+  claims pick disjoint rows; after the commit, the lease keeps other
+  relays off the row. No row lock or transaction is held while waiting for
+  the broker. Lease and retry times use the database clock, so relays on
+  different hosts agree.
+- **Several relays.** Every control-plane replica runs a relay; they share
+  the outbox safely through leases (`TestOutboxConcurrentRelays`).
+- **Confirm before mark.** `PublishTask` returns only after the broker's
+  publisher confirm. A nack, a closed channel, a timeout or a returned
+  message all count as failures. The mark runs on a context that survives
+  shutdown, so a confirm received during shutdown is still recorded.
+- **Retries.** A failed publish increments `attempts`, stores
+  `last_error` and makes the event due again after an exponential backoff
+  from `OUTBOX_RETRY_MIN` to `OUTBOX_RETRY_MAX` with jitter. The rest of
+  the batch is handed back untried (no attempt charged). Database
+  failures back the whole loop off the same way. Failures are logged as
+  warnings, and as errors from the 5th attempt on.
+- **Never discarded.** There is no attempt limit and no dead-letter
+  table: an event stays in the outbox until the broker confirms it.
+  Stuck events are visible with
+  `SELECT task_id, attempts, last_error FROM outbox_events WHERE published_at IS NULL`.
+- **Crash recovery.** If a relay dies with a claimed batch, the events
+  become claimable again when the lease expires (`TestOutboxAbandonedClaimIsRedelivered`).
+  A relay also stops starting new publishes when less than two publish
+  timeouts of its lease remain, and hands the rest of the batch back, so
+  a slow broker cannot make a lease expire mid-publish.
+- **Startup and shutdown.** The broker being down at startup is not fatal:
+  the API serves requests, events accumulate, and the publisher connects
+  when the broker appears. On SIGINT/SIGTERM the relay stops claiming,
+  hands back untried events for immediate pickup, and the publisher's
+  connection is closed after the relay has stopped.
+
+### Broker topology and message format
+
+| Object | Name | Properties |
+| --- | --- | --- |
+| Exchange | `tenant.tasks` | topic, durable |
+| Queue | `tenant.tasks.worker` | quorum (replicated, always durable), bound with `task.#` |
+| Routing key | `task.<type>` | `task.deploy`, `task.update`, `task.destroy` |
+
+The publisher declares the exchange, queue and binding on every connect
+(idempotently), so events published before any worker starts are kept, not
+dropped as unroutable. Messages are published with `mandatory`: if no queue
+is bound, the broker returns the message, the publish fails and is retried,
+and the next connection re-declares the topology.
+
+AMQP properties: `message_id` = task ID, `delivery_mode` = 2 (persistent),
+`content_type` = `application/json`, `type` = `task`, `app_id` =
+`tenant-control-plane`. Body (the task as committed):
+
+```json
+{
+  "id": "6f1c...",
+  "type": "deploy",
+  "tenant_id": "0b7e...",
+  "status": "accepted",
+  "created_at": "2026-01-02T03:04:05.006Z",
+  "updated_at": "2026-01-02T03:04:05.006Z"
+}
+```
+
+Inspecting it locally (management UI at <http://localhost:15672>,
+credentials from `.env`):
+
+```bash
+docker compose exec rabbitmq rabbitmqctl list_queues name type durable messages
+docker compose exec postgres psql -U control_plane -d control_plane \
+  -c "SELECT task_id, published_at, attempts, last_error FROM outbox_events ORDER BY id DESC LIMIT 10"
+# Simulate a broker outage: the API keeps accepting work, events pile up
+# with growing attempts, and are delivered once the broker is back.
+docker compose stop rabbitmq; sleep 10; docker compose start rabbitmq
+```
+
+### Tests
+
+| Behaviour | Test |
+| --- | --- |
+| tenant, task and event commit or roll back together | `postgres/tx_test.go`, `postgres/application_test.go` |
+| only committed events are claimable | `TestOutboxClaimSeesOnlyCommittedEvents` |
+| concurrent claims are disjoint | `TestOutboxConcurrentClaimsAreDisjoint`, `TestOutboxConcurrentRelays` |
+| every mutation publishes its task; rejected calls publish nothing | `TestOutboxPublishesEveryMutation` |
+| broker unavailable at startup | `TestOutboxBrokerUnavailableAtStartup`, `TestPublishTaskBrokerUnavailableAtStartup` |
+| transient failures (connections cut repeatedly) | `TestOutboxTransientBrokerFailures`, `TestPublishTaskReconnects` |
+| crash between confirm and mark: same event redelivered | `TestOutboxCrashWindowRedelivers`, `TestRelayCrashWindowRepublishes` |
+| abandoned claim redelivered after the lease | `TestOutboxAbandonedClaimIsRedelivered` |
+| broker nack, unroutable message, unresponsive broker | `TestPublishTaskNacked`, `TestPublishTaskUnroutable`, `TestPublishTaskUnresponsiveBroker` |
+| durable exchange, quorum queue, persistent messages | `TestTopologyIsDurable`, `TestPublishTaskMessage` |
+| backoff, retry-until-published, shutdown mid-publish | `outbox_relay_test.go` |
+
+Integration tests start PostgreSQL and RabbitMQ containers with
+testcontainers (or use `TEST_DATABASE_URL` / `TEST_RABBITMQ_URL`) and skip
+under `-short` or without Docker. Broker failures are injected with
+`testsupport/tcpproxy` between the relay and RabbitMQ.
 
 ## HTTP API
 
@@ -286,7 +460,11 @@ No credentials are committed; `.env` is git-ignored.
 | `HTTP_REQUEST_TIMEOUT`    | `10s`   | api (must be below `HTTP_WRITE_TIMEOUT`) |
 | `HTTP_READ_HEADER_TIMEOUT` / `HTTP_READ_TIMEOUT` / `HTTP_WRITE_TIMEOUT` / `HTTP_IDLE_TIMEOUT` | `5s` / `15s` / `15s` / `60s` | api |
 | `HTTP_SHUTDOWN_TIMEOUT`   | `15s`   | api |
-| `OUTBOX_POLL_INTERVAL`    | `500ms` | api |
+| `OUTBOX_POLL_INTERVAL`    | `500ms` | api: wait between polls when nothing is due |
+| `OUTBOX_BATCH_SIZE`       | `100`   | api: events claimed per poll |
+| `OUTBOX_LEASE`            | `30s`   | api: claim duration; must exceed 2 x `OUTBOX_PUBLISH_TIMEOUT` |
+| `OUTBOX_PUBLISH_TIMEOUT`  | `5s`    | api: bound on one publish incl. confirm, and on the mark |
+| `OUTBOX_RETRY_MIN` / `OUTBOX_RETRY_MAX` | `500ms` / `30s` | api: retry backoff bounds |
 | `LOG_LEVEL`               | `info`  | api, worker |
 | `WORKER_FAIL_RATE` / `--fail-rate`         | `0`    | worker |
 | `WORKER_MIN_DELAY_MS` / `--min-delay-ms`   | `500`  | worker |

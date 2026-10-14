@@ -223,30 +223,96 @@ func (r outboxRepository) Enqueue(ctx context.Context, task domain.Task) error {
 	return nil
 }
 
-// ClaimPending returns up to limit unpublished events, oldest first, as
-// the task they announce (status and updated_at as of the event). FOR
-// UPDATE SKIP LOCKED makes concurrent relays claim disjoint sets; the
-// claim lasts until the surrounding transaction ends.
-func (r outboxRepository) ClaimPending(ctx context.Context, limit int) ([]domain.Task, error) {
+// ClaimPending leases up to limit due events, oldest first, and returns
+// them as the task they announce (status and updated_at as of the event).
+//
+// The claim is a single UPDATE: run on the pool it commits on its own, so
+// the row locks last only for the statement and no transaction is held
+// while the caller publishes. FOR UPDATE SKIP LOCKED makes concurrent
+// claims pick disjoint rows; once a claim commits, the moved available_at
+// keeps other relays off the row until the lease expires. Lease and retry
+// times use the database clock, so relays on different hosts agree.
+//
+// Rows of uncommitted transactions are invisible, so only committed events
+// are claimed. The relay selects by published_at IS NULL rather than "id
+// above the last one seen", so an event whose transaction commits after a
+// later-numbered one is not skipped.
+func (r outboxRepository) ClaimPending(ctx context.Context, limit int, lease time.Duration) ([]application.OutboxEvent, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("claim outbox events: limit must be positive, got %d", limit)
 	}
+	if lease <= 0 {
+		return nil, fmt.Errorf("claim outbox events: lease must be positive, got %v", lease)
+	}
 	rows, err := r.q.Query(ctx, `
-		SELECT t.id, t.type, t.tenant_id, o.task_status, t.created_at, o.occurred_at
-		FROM outbox_events o
-		JOIN tasks t ON t.id = o.task_id
-		WHERE o.published_at IS NULL
-		ORDER BY o.id
-		LIMIT $1
-		FOR UPDATE OF o SKIP LOCKED`, limit)
+		WITH due AS (
+			SELECT id FROM outbox_events
+			WHERE published_at IS NULL AND available_at <= now()
+			ORDER BY id
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		), claimed AS (
+			UPDATE outbox_events o
+			SET available_at = now() + $2::bigint * interval '1 microsecond',
+			    claim_token  = gen_random_uuid()
+			FROM due
+			WHERE o.id = due.id
+			RETURNING o.id, o.task_id, o.task_status, o.occurred_at, o.attempts, o.claim_token
+		)
+		SELECT t.id, t.type, t.tenant_id, c.task_status, t.created_at, c.occurred_at, c.attempts, c.claim_token
+		FROM claimed c
+		JOIN tasks t ON t.id = c.task_id
+		ORDER BY c.id`,
+		limit, lease.Microseconds())
 	if err != nil {
 		return nil, translate("claim outbox events", err)
 	}
-	tasks, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.Task, error) { return scanTask(row) })
+	events, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (application.OutboxEvent, error) {
+		var e application.OutboxEvent
+		t := &e.Task
+		if err := row.Scan(&t.ID, &t.Type, &t.TenantID, &t.Status, &t.CreatedAt, &t.UpdatedAt, &e.Attempts, &e.ClaimToken); err != nil {
+			return application.OutboxEvent{}, err
+		}
+		t.CreatedAt = domain.NormalizeTime(t.CreatedAt)
+		t.UpdatedAt = domain.NormalizeTime(t.UpdatedAt)
+		return e, nil
+	})
 	if err != nil {
 		return nil, translate("claim outbox events", err)
 	}
-	return tasks, nil
+	return events, nil
+}
+
+// maxLastErrorLen bounds the stored failure text.
+const maxLastErrorLen = 1000
+
+// Reschedule ends e's claim and makes the event claimable after delay.
+// The claim token check means a relay whose lease expired (and whose
+// event was claimed again) cannot move another relay's lease; the
+// published_at check means a published event stays published.
+func (r outboxRepository) Reschedule(ctx context.Context, e application.OutboxEvent, delay time.Duration, failure error) error {
+	if !isUUID(e.Task.ID) || !isUUID(e.ClaimToken) {
+		return fmt.Errorf("reschedule outbox event for task %q: invalid task id or claim token", e.Task.ID)
+	}
+	var failed bool
+	var reason *string
+	if failure != nil {
+		failed = true
+		msg := failure.Error()
+		reason = &msg
+	}
+	_, err := r.q.Exec(ctx, `
+		UPDATE outbox_events
+		SET available_at = now() + $3::bigint * interval '1 microsecond',
+		    claim_token  = NULL,
+		    attempts     = attempts + CASE WHEN $4 THEN 1 ELSE 0 END,
+		    last_error   = CASE WHEN $4 THEN left($5, $6) ELSE last_error END
+		WHERE task_id = $1 AND claim_token = $2 AND published_at IS NULL`,
+		e.Task.ID, e.ClaimToken, max(delay, 0).Microseconds(), failed, reason, maxLastErrorLen)
+	if err != nil {
+		return translate("reschedule outbox event", err)
+	}
+	return nil
 }
 
 // MarkPublished records that the event for taskID reached the broker. It

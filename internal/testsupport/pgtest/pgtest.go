@@ -14,7 +14,7 @@
 // gets its own database cloned from it (CREATE DATABASE ... TEMPLATE),
 // which is fast and fully isolates tests from each other.
 //
-// A test package using pgtest calls Main from its TestMain.
+// A test package using pgtest calls Main (or Teardown) from its TestMain.
 package pgtest
 
 import (
@@ -52,7 +52,7 @@ var harness struct {
 // Call it from TestMain: func TestMain(m *testing.M) { pgtest.Main(m) }.
 func Main(m *testing.M) {
 	code := m.Run()
-	teardownHarness()
+	Teardown()
 	os.Exit(code)
 }
 
@@ -108,7 +108,10 @@ func setupHarness(external string) error {
 	return postgres.Migrate(ctx, pool)
 }
 
-func teardownHarness() {
+// Teardown removes the database server or template the harness created.
+// Main calls it; a package that also uses another harness calls it from
+// its own TestMain.
+func Teardown() {
 	if harness.container != nil {
 		_ = testcontainers.TerminateContainer(harness.container)
 		return

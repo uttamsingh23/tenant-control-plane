@@ -1,8 +1,9 @@
 // Package rabbitmq connects the control plane and the worker simulator
 // through RabbitMQ.
 //
-// Control plane: TaskPublisher (outbound task events) and UpdateConsumer
-// (inbound progress updates). Worker: TaskConsumer and UpdatePublisher.
+// Control plane: TaskPublisher (outbound task events, see publisher.go) and
+// UpdateConsumer (inbound progress updates). Worker: TaskConsumer and
+// UpdatePublisher. The broker objects are described in topology.go.
 package rabbitmq
 
 import (
@@ -33,21 +34,6 @@ type UpdateApplier interface {
 // TaskHandler processes one task event; *worker.Simulator satisfies it.
 type TaskHandler interface {
 	Process(ctx context.Context, task domain.Task) error
-}
-
-// TaskPublisher publishes task events for workers.
-type TaskPublisher struct {
-	url string
-}
-
-// NewTaskPublisher returns a publisher for the broker at url.
-func NewTaskPublisher(url string) *TaskPublisher {
-	return &TaskPublisher{url: url}
-}
-
-// PublishTask implements application.TaskPublisher.
-func (p *TaskPublisher) PublishTask(context.Context, domain.Task) error {
-	return notImplemented("publish task")
 }
 
 // UpdateConsumer consumes worker progress updates and hands them to an
